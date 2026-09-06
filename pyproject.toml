@@ -1,0 +1,17 @@
+[project]
+name = "material-profile-worker"
+version = "0.1.0"
+description = "Worker that converts Feishu Bitable material submissions into Git-backed material profiles."
+requires-python = ">=3.11"
+dependencies = [
+    "lark-oapi",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+material-worker = "material_worker.main:main"
