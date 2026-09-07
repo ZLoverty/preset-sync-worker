@@ -30,8 +30,8 @@ def test_assert_transition_raises():
 
 
 def test_terminal_states():
+    """V2-P0:终态只含 已通过/已拒绝;审核中 是在途状态,由审查同步推进。"""
     for status in (
-        SubmissionStatus.REVIEWING,
         SubmissionStatus.APPROVED,
         SubmissionStatus.REJECTED,
     ):
@@ -41,20 +41,23 @@ def test_terminal_states():
         SubmissionStatus.DRAFT,
         SubmissionStatus.PENDING,
         SubmissionStatus.PROCESSING,
+        SubmissionStatus.REVIEWING,  # V2-P0:审核中 不再视为已收尾
         SubmissionStatus.FAILED,
     ):
         assert not status.is_terminal(), status
 
 
 def test_retry_reuse_semantics():
+    """V2-P0:重复点击复用同一提交的状态组 = 待处理/处理中/失败/审核中。"""
     for status in (
         SubmissionStatus.PENDING,
         SubmissionStatus.PROCESSING,
         SubmissionStatus.FAILED,
+        SubmissionStatus.REVIEWING,  # V2-P0:在途提交的重复触发复用
     ):
         assert status.retry_reuses_same_submission(), status
-    assert not SubmissionStatus.REVIEWING.retry_reuses_same_submission()
     assert not SubmissionStatus.APPROVED.retry_reuses_same_submission()
+    assert not SubmissionStatus.REJECTED.retry_reuses_same_submission()
 
 
 def test_from_table_values():

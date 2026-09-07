@@ -53,13 +53,16 @@ def new_submission_id() -> str:
 
 
 def resolve_submission_id(current_fields: dict[str, Any]) -> str:
-    """决定本次点击复用还是新开一个提交 ID(P3 #18 / 已确认的业务语义)。
+    """决定本次点击复用还是新开一个提交 ID(P3 #18 / V2-P0 语义更新)。
 
     规则(按行当前状态区分):
-    - 已有提交 ID 且行处于 待处理/处理中/失败(同一次提交的重试)
-      -> 复用该 ID(保证重试不会产生第二个 branch/PR);
-    - 行处于 审核中/已通过/已拒绝(上一轮提交已收尾)或无提交 ID
-      -> 生成新 ID,开启新一轮提交。
+    - 已有提交 ID 且行处于 待处理/处理中/失败/审核中
+      -> 复用该 ID(同一次提交的处理,保证不会产生第二个 branch/PR)。
+      注意:审核中 行的重复点击在 service 层短路处理(按 PR 实况收敛),
+      不会走到本函数;这里把 审核中 归入复用组只表达"它是在途提交",
+      唯一例外是「审核中 但无提交 ID」的行(没有可复用的在途提交);
+    - 行处于 已通过/已拒绝(上一轮提交已收尾,再次点击 = 新一轮)
+      或无提交 ID -> 生成新 ID,开启新一轮提交。
     """
     status = SubmissionStatus.from_table(current_fields.get(fields.STATUS))
     existing = current_fields.get(fields.SUBMISSION_ID)

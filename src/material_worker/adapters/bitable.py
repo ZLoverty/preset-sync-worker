@@ -221,6 +221,10 @@ class BitableClient:
             "update record",
         )
 
+    def clear_request(self, record_id: str) -> None:
+        """V2-P0:仅清除 已请求(在途行的重复触发就此打住),不动状态/内容。"""
+        self.update_record(record_id, {fields.REQUESTED: False})
+
     def mark_processing(
         self,
         record_id: str,

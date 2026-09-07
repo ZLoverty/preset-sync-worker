@@ -86,13 +86,8 @@ class SubmissionService:
                     f"[审查同步] record={record_id} "
                     f"submission={submission_id} -> 已拒绝 (PR 关闭未合并)"
                 )
-            elif state is None and warn_key not in self._warned_no_pr:
-                self._warned_no_pr.add(warn_key)
-                print(
-                    f"[审查同步] record={record_id} "
-                    f"submission={submission_id} 在 Git 上找不到对应 PR,"
-                    f"保持 审核中(若 PR 被手动删除,请人工处理该行)"
-                )
+            elif state is None:
+                self._warn_pr_missing(record_id, submission_id)
 
     def _mark_reviewed(
         self,
@@ -112,6 +107,21 @@ class SubmissionService:
                 f"[严重错误] 无法回写 {to.value} record={record_id}: {exc}"
             )
 
+    def _warn_pr_missing(self, record_id: str, submission_id: str) -> None:
+        """Git 上找不到该提交的 PR:一次性告警,行保持 审核中 等人工处理。
+
+        审查同步与 V2-P0 重复点击两条路径共用同一去重集合,避免刷屏。
+        """
+        warn_key = (record_id, submission_id)
+        if warn_key in self._warned_no_pr:
+            return
+        self._warned_no_pr.add(warn_key)
+        print(
+            f"[审查同步] record={record_id} "
+            f"submission={submission_id} 在 Git 上找不到对应 PR,"
+            f"保持 审核中(若 PR 被手动删除,请人工处理该行)"
+        )
+
     # ------------------------------------------------------------------
     def process_record(
         self,
@@ -123,7 +133,21 @@ class SubmissionService:
         - 数据不完整/非法:直接永久失败,绝不进入 Git(P0 #5);
         - 之后任何临时失败都会把 已请求 重新置 true,由下一轮轮询自动重试,
           重试次数超过上限或遇永久错误才置为 失败。
+        - 审核中(在途提交)行的重复触发不进入本轮完整流程,按 PR 实况
+          轻处理,绝不产生第二个 PR(V2-P0,见 _handle_reviewing_click)。
         """
+        # 0) V2-P0:在途行(审核中)的重复点击短路 —— 只收敛、不开新一轮。
+        status = SubmissionStatus.from_table(
+            fields_snapshot.get(fields.STATUS)
+        )
+        if status is SubmissionStatus.REVIEWING:
+            raw_sid = fields_snapshot.get(fields.SUBMISSION_ID)
+            submission_id = str(raw_sid).strip() if raw_sid else ""
+            if submission_id:
+                self._handle_reviewing_click(record_id, submission_id)
+                return
+            # 审核中 但无提交 ID:没有在途提交可对照,落入常规流程开新一轮。
+
         # 1) 解析 + 校验(claim 之前完成,坏数据不占坑)
         try:
             profile = MaterialProfile.from_bitable_record(record_id, fields_snapshot)
@@ -132,7 +156,8 @@ class SubmissionService:
             self._fail_permanently(record_id, f"数据校验失败: {exc}")
             return
 
-        # 2) 提交 ID:非终态复用既有 ID,否则新开一轮(P3 #18,已确认语义)
+        # 2) 提交 ID:复用组(待处理/处理中/失败/审核中)复用既有 ID,
+        #    否则(已通过/已拒绝 等终态)新开一轮(P3 #18 / V2-P0)
         submission_id = resolve_submission_id(fields_snapshot)
         submission = MaterialSubmission(
             submission_id=submission_id,
@@ -177,6 +202,46 @@ class SubmissionService:
                 submission_id,
                 retry_count,
                 f"{type(exc).__name__}: {exc}",
+            )
+
+    def _handle_reviewing_click(
+        self,
+        record_id: str,
+        submission_id: str,
+    ) -> None:
+        """V2-P0:审核中(在途)行再次点击的轻处理 —— 绝不产生第二个 PR。
+
+        按该提交在 Git 上的实际 PR 状态收敛(不依赖"状态==审核中"这一个
+        条件,先确认在途 PR 的实况):
+
+        - PR 仍打开   -> 保持 审核中,清除 已请求(本轮重复触发就此打住);
+        - PR 已合并/已关闭 -> 清除 已请求,交回本轮随后的审查同步
+                             (同轮置 已通过/已拒绝;关闭理由见 V2-P3);
+        - Git 上找不到该提交的 PR -> 清除 已请求 + 一次性告警(需人工处理);
+        - PR 状态查询失败(瞬时)   -> 不动行,已请求 保持 true,下轮自然重试。
+        """
+        try:
+            state = self.repository.submission_pr_state(submission_id)
+        except Exception as exc:
+            print(
+                f"[重复点击:无法确认 PR] record={record_id} "
+                f"submission={submission_id} {type(exc).__name__}: {exc} "
+                f"(已请求 保持 true,下轮自动重试)"
+            )
+            return
+
+        self.bitable.clear_request(record_id)
+        if state == "open":
+            print(
+                f"[重复点击] record={record_id} submission={submission_id} "
+                f"在途 PR 仍打开:保持 审核中,不创建新 PR"
+            )
+        elif state is None:
+            self._warn_pr_missing(record_id, submission_id)
+        else:  # merged / closed:审查同步同轮落终态(已通过/已拒绝)
+            print(
+                f"[重复点击] record={record_id} submission={submission_id} "
+                f"PR 状态={state}:交回审查同步落终态,不创建新 PR"
             )
 
     # ------------------------------------------------------------------

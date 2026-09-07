@@ -33,6 +33,10 @@ class FakeBitable:
     def update_record(self, record_id, values):
         self.records[record_id].update(values)
 
+    def clear_request(self, record_id):
+        """V2-P0:仅清除 已请求(在途行重复触发打住)。"""
+        self.records[record_id][fields.REQUESTED] = False
+
     def get_record(self, record_id):
         return record_id, dict(self.records[record_id])
 
@@ -294,11 +298,142 @@ def test_git_ok_but_bitable_update_failed_then_retried():
     assert row[fields.ERROR_MSG] == ""
 
 
-def test_terminal_state_click_opens_new_submission():
-    """终态(审核中)后再点按钮 = 新一轮提交,生成新提交 ID/PR。"""
+# ----------------------------------------------------------------------
+# V2-P0:审核中(在途提交)重复点击 —— 按 PR 实况收敛,绝不产生第二个 PR
+# ----------------------------------------------------------------------
+
+def test_reviewing_click_with_open_pr_keeps_reviewing_no_second_pr():
+    """V2-P0:审核中 + PR 仍打开时再次点击 -> 不创建第二个 PR/新提交。"""
+    bitable = FakeBitable("rec-1", reviewing_row("rec-1", "sub-old"))
+    repo = FakeGitRepository()
+    repo.pr_states["sub-old"] = "open"
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.REQUESTED] is False  # 本轮重复触发就此打住
+    assert row[fields.SUBMISSION_ID] == "sub-old"  # 提交 ID 不被替换
+    assert repo.submit_calls == []  # 完全没走 Git 提交
+    assert len(repo.pull_requests) == 0
+
+
+def test_reviewing_click_merged_pr_then_sync_approves():
+    """V2-P0:重复点击时 PR 已合并 -> 不开新一轮;同轮审查同步置 已通过。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_states["sid-1"] = "merged"
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.REQUESTED] is False
+    assert repo.submit_calls == []
+
+    service.sync_reviewing_rows()  # 同轮随后的审查同步落终态
+    assert bitable.records["rec-1"][fields.STATUS] == SubmissionStatus.APPROVED.value
+    assert len(repo.pull_requests) == 0
+
+
+def test_reviewing_click_closed_pr_then_sync_rejects():
+    """V2-P0:重复点击时 PR 已关闭未合并 -> 同轮审查同步置 已拒绝,不新开轮。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_states["sid-1"] = "closed"
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    assert repo.submit_calls == []
+    assert bitable.records["rec-1"][fields.REQUESTED] is False
+
+    service.sync_reviewing_rows()
+    assert bitable.records["rec-1"][fields.STATUS] == SubmissionStatus.REJECTED.value
+    assert bitable.marked == [("rec-1", SubmissionStatus.REJECTED.value)]
+
+
+def test_reviewing_click_pr_query_failure_keeps_request_alive():
+    """V2-P0:确认 PR 实况时 Git 查询失败(瞬时)-> 不动行,下轮自然重试。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_state_errors["sid-1"] = RetryableError("git down")
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.REQUESTED] is True  # 保持触发信号,由下一轮再确认
+    assert repo.submit_calls == []
+
+
+def test_reviewing_click_pr_missing_clears_request_and_warns_once():
+    """V2-P0:Git 上找不到在途 PR -> 清 已请求 + 保持 审核中(人工处理)。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    # 第二次点击(已请求 重新置 true):告警只发一次,行保持 审核中
+    bitable.records["rec-1"][fields.REQUESTED] = True
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.REQUESTED] is False
+    assert service._warned_no_pr == {("rec-1", "sid-1")}
+
+
+def test_reviewing_click_without_submission_id_starts_new_round():
+    """V2-P0:审核中 但无提交 ID(没有在途提交可对照)-> 按常规开新一轮。"""
+    row = reviewing_row()
+    row[fields.SUBMISSION_ID] = None  # type: ignore[assignment]
+    bitable = FakeBitable("rec-1", row)
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.REQUESTED] is False
+    assert len(repo.pull_requests) == 1  # 只产生这一轮的一个 PR
+
+
+def test_fast_double_click_produces_single_pr():
+    """V2-P0/§3.5:快速双击(第二次点击落在下一轮询)只产生一个 PR。"""
+    bitable = FakeBitable("rec-1", snapshot())
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    # 第一次点击:正常处理 -> 审核中 + 一个 PR
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+    sid = bitable.records["rec-1"][fields.SUBMISSION_ID]
+    assert len(repo.pull_requests) == 1
+
+    # 第二次点击落在下一轮询(已请求=true,行处于 审核中,PR 打开)
+    bitable.records["rec-1"][fields.REQUESTED] = True
+    repo.pr_states[sid] = "open"
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    assert len(repo.pull_requests) == 1  # PR 数量不增加
+    assert repo.submit_calls == [sid]  # 第二次点击没有再次提交
+    assert bitable.records["rec-1"][fields.REQUESTED] is False
+    assert bitable.records["rec-1"][fields.STATUS] == SubmissionStatus.REVIEWING.value
+
+
+# ----------------------------------------------------------------------
+# V2-P0/Q1:已通过/已拒绝(终态)再次点击 = 新一轮提交(语义保持不变)
+# ----------------------------------------------------------------------
+
+def test_approved_click_opens_new_submission():
+    """已通过 后再点按钮 = 新一轮提交(内容迭代),生成新提交 ID/PR。"""
     bitable = FakeBitable(
         "rec-1",
-        snapshot(status=SubmissionStatus.REVIEWING, submission_id="sub-old"),
+        snapshot(status=SubmissionStatus.APPROVED, submission_id="sub-old"),
     )
     repo = FakeGitRepository()
     service = SubmissionService(bitable=bitable, repository=repo)
@@ -309,7 +444,24 @@ def test_terminal_state_click_opens_new_submission():
     sid = row[fields.SUBMISSION_ID]
     assert sid != "sub-old"
     assert len(repo.pull_requests) == 1
-    assert repo.pull_requests[sid] is not None
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+
+
+def test_rejected_click_opens_new_submission():
+    """已拒绝 后再点按钮 = 新一轮提交(修正后重提),生成新提交 ID/PR。"""
+    bitable = FakeBitable(
+        "rec-1",
+        snapshot(status=SubmissionStatus.REJECTED, submission_id="sub-old"),
+    )
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    sid = row[fields.SUBMISSION_ID]
+    assert sid != "sub-old"
+    assert len(repo.pull_requests) == 1
     assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
 
 

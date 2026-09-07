@@ -87,9 +87,18 @@ def test_resolve_reuses_id_for_pending_processing_failed():
         assert sid == "sub-keep"
 
 
+def test_resolve_reuses_id_for_reviewing_with_existing_id():
+    """V2-P0:审核中(在途提交)带提交 ID 时归入复用组(service 层会短路,
+    resolve 层保持同一语义:不因重复触发换 ID)。"""
+    sid = resolve_submission_id(
+        _snapshot(SubmissionStatus.REVIEWING, submission_id="sub-inflight")
+    )
+    assert sid == "sub-inflight"
+
+
 def test_resolve_generates_new_id_after_terminal_state():
+    """V2-P0:终态(已通过/已拒绝)再次点击 = 新一轮,生成新 ID。"""
     for status in (
-        SubmissionStatus.REVIEWING,
         SubmissionStatus.APPROVED,
         SubmissionStatus.REJECTED,
     ):
