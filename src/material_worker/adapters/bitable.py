@@ -22,9 +22,23 @@ from material_worker.exceptions import (
     RetryableError,
 )
 
-# Feishu Bitable 字段 type:1=文本 2=数字 7=复选框 3=单选
+# Feishu Bitable 字段 type:1=文本 2=数字 3=单选 4=多选 7=复选框 17=附件
 FIELD_TYPE_TEXT = 1
 FIELD_TYPE_NUMBER = 2
+FIELD_TYPE_SINGLE_SELECT = 3
+FIELD_TYPE_MULTI_SELECT = 4
+FIELD_TYPE_CHECKBOX = 7
+FIELD_TYPE_ATTACHMENT = 17
+
+# 字段 type -> 中文名(仅用于错误提示)
+_FIELD_TYPE_LABELS: dict[int, str] = {
+    FIELD_TYPE_TEXT: "文本",
+    FIELD_TYPE_NUMBER: "数字",
+    FIELD_TYPE_SINGLE_SELECT: "单选",
+    FIELD_TYPE_MULTI_SELECT: "多选",
+    FIELD_TYPE_CHECKBOX: "复选框",
+    FIELD_TYPE_ATTACHMENT: "附件",
+}
 
 # worker 可安全自动创建的缺失列:列名 -> (字段类型)
 AUTO_CREATE_FIELDS: dict[str, int] = {
@@ -43,6 +57,9 @@ _MANUAL_FIELDS: dict[str, str] = {
     ),
     fields.REQUESTED: "复选框列(按钮 -> Automation 置为已勾选)",
 }
+
+# V2-P1:单选列「状态」必须具备状态机全集选项
+_STATUS_REQUIRED_OPTIONS: list[str] = [s.value for s in SubmissionStatus]
 
 
 def _make_callable_error(exc: Exception) -> RetryableError:
@@ -264,22 +281,68 @@ class BitableClient:
         )
 
     # ------------------------------------------------------------------
-    # Schema 保障(启动时调用,P3 #15)
+    # Schema 保障(启动时调用,P3 #15 / V2-P1)
     # ------------------------------------------------------------------
     def ensure_schema(self) -> None:
-        """自动创建缺失的文本/数字列;状态/已请求 缺失则报错说明。"""
-        existing = {f.field_name for f in self._list_field_definitions()}
+        """自动创建缺失的文本/数字列;校验 状态 列的存在、类型与选项(V2-P1)。
+
+        - 「状态」必须是单选列且选项覆盖状态机全集;类型/选项不对一律启动失败,
+          错误信息带列名、当前类型、期望类型与修复指引;
+        - 缺失的文本/数字列自动创建,不阻塞启动。
+        """
+        by_name = {
+            f.field_name: f for f in self._list_field_definitions() if f.field_name
+        }
 
         for manual, hint in _MANUAL_FIELDS.items():
-            if manual not in existing:
+            if manual not in by_name:
                 raise PermanentError(
                     f"Bitable 表格缺少列「{manual}」。请手工创建:{hint}"
                 )
 
+        self._ensure_status_single_select(by_name[fields.STATUS])
+
         for field_name, field_type in AUTO_CREATE_FIELDS.items():
-            if field_name in existing:
+            if field_name in by_name:
                 continue
             self._create_text_field(field_name, field_type)
+
+    def _ensure_status_single_select(self, field_def: Any) -> None:
+        """V2-P1:校验「状态」列为单选且选项覆盖状态机全集,否则启动失败。
+
+        修复建议说明:飞书不支持直接把已有字段改成另一种类型,
+        只能人工删除后按单选重建并重新配置选项。
+        """
+        actual_type = field_def.type
+        actual_label = _FIELD_TYPE_LABELS.get(
+            actual_type, f"未知(type={actual_type})"
+        )
+        if actual_type != FIELD_TYPE_SINGLE_SELECT:
+            raise PermanentError(
+                f"Bitable 列「{fields.STATUS}」的类型不是单选:"
+                f"当前类型={actual_label},期望类型=单选。\n"
+                f"修复建议:飞书不支持直接将现有字段类型转换为目标类型。"
+                f"请人工删除/重建「{fields.STATUS}」字段,"
+                f"并重新配置状态选项("
+                + " / ".join(_STATUS_REQUIRED_OPTIONS)
+                + ")。"
+            )
+
+        property_def = getattr(field_def, "property", None)
+        raw_options = getattr(property_def, "options", None) or []
+        options = {
+            opt.name
+            for opt in raw_options
+            if getattr(opt, "name", None)
+        }
+        missing = [o for o in _STATUS_REQUIRED_OPTIONS if o not in options]
+        if missing:
+            raise PermanentError(
+                f"Bitable 单选列「{fields.STATUS}」缺少状态选项:"
+                f"{'、'.join(missing)}。\n"
+                f"修复建议:在字段设置中手动添加缺失选项"
+                f"(选项应为: " + " / ".join(_STATUS_REQUIRED_OPTIONS) + ")。"
+            )
 
     def _list_field_definitions(self) -> list[AppTableField]:
         fields_out: list[AppTableField] = []
