@@ -26,8 +26,11 @@ SUBMISSION_ID = "提交 ID"
 PR_URL = "PR URL"
 ERROR_MSG = "错误信息"
 RETRY_COUNT = "重试次数"
+# V2-P3:PR 关闭(未合并)时的关闭理由,由 worker 从 Git 侧最后一条评论同步;
+# 新一轮 claim 时清空。合并通过不写理由。
+CLOSE_REASON = "关闭理由"
 
 # 期望 worker 自动保证存在的文本/数字列:
-#   提交 ID / PR URL / 错误信息(文本)、重试次数(数字)。
+#   提交 ID / PR URL / 错误信息 / 关闭理由(文本)、重试次数(数字)。
 # 「状态」(单选)与「已请求」(复选框)由人工在表格中创建,
 # 缺失时 worker 启动会报错并给出提示。

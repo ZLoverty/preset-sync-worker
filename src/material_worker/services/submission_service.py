@@ -20,6 +20,9 @@ from material_worker.exceptions import (
     RetryableError,
 )
 
+# V2-P3:PR 被关闭(未合并)但 Git 侧无任何评论可作关闭理由时的兜底文案。
+CLOSE_REASON_FALLBACK = "PR 已关闭,未说明原因"
+
 
 class SubmissionService:
     """业务编排层:输入校验 -> claim -> Git 幂等提交 -> 回写状态。
@@ -44,9 +47,11 @@ class SubmissionService:
         """审查同步:对照 Git 侧 PR 状态推进「审核中」行。
 
         - PR 已合并        -> 状态=已通过;
-        - PR 关闭未合并    -> 状态=已拒绝;
+        - PR 关闭未合并    -> 状态=已拒绝,回写关闭理由(V2-P3);
         - PR 仍打开/不存在 -> 保持不变(行留 审核中,下一轮再看)。
 
+        V2-P3:关闭理由 = 关闭前最后一条普通评论正文;无评论写兜底文案;
+        理由读取失败记日志、理由留空 —— 两种情况都不阻塞状态推进。
         Git 查询失败的行使状态保持 审核中,由下一轮自然重试
         (瞬态自愈,不误标终态);单行异常不中断其余行。
         """
@@ -80,11 +85,18 @@ class SubmissionService:
                     f"submission={submission_id} -> 已通过 (PR 已合并)"
                 )
             elif state == "closed":
-                self._mark_reviewed(record_id, current, SubmissionStatus.REJECTED)
+                close_reason = self._fetch_close_reason(record_id, submission_id)
+                self._mark_reviewed(
+                    record_id,
+                    current,
+                    SubmissionStatus.REJECTED,
+                    close_reason,
+                )
                 self._warned_no_pr.discard(warn_key)
                 print(
                     f"[审查同步] record={record_id} "
-                    f"submission={submission_id} -> 已拒绝 (PR 关闭未合并)"
+                    f"submission={submission_id} -> 已拒绝 (PR 关闭未合并,"
+                    f"关闭理由: {close_reason or '(留空,待人工补充)'})"
                 )
             elif state is None:
                 self._warn_pr_missing(record_id, submission_id)
@@ -94,18 +106,43 @@ class SubmissionService:
         record_id: str,
         current: SubmissionStatus,
         to: SubmissionStatus,
+        close_reason: str = "",
     ) -> None:
-        """推进审核中行到终态;回写失败时行保持 审核中,下轮重试。"""
+        """推进审核中行到终态;回写失败时行保持 审核中,下轮重试。
+
+        V2-P3:落 已拒绝 时带上关闭理由(已通过 不写理由,传空)。
+        """
         current.assert_can_transition(to)
         try:
             if to is SubmissionStatus.APPROVED:
                 self.bitable.mark_approved(record_id)
             else:
-                self.bitable.mark_rejected(record_id)
+                self.bitable.mark_rejected(record_id, close_reason)
         except Exception as exc:
             print(
                 f"[严重错误] 无法回写 {to.value} record={record_id}: {exc}"
             )
+
+    def _fetch_close_reason(self, record_id: str, submission_id: str) -> str:
+        """V2-P3:取该提交被关闭 PR 的关闭理由文本(仅 closed 分支调用)。
+
+        - 关闭前最后一条评论的正文可作理由 -> 原样返回;
+        - Git 侧无评论 -> 返回兜底文案(CLOSE_REASON_FALLBACK);
+        - 评论读取失败(瞬时/网络)   -> 记日志返回空串,状态推进不受阻塞,
+          理由列留空,由人工在 Bitable 里补充。
+        """
+        try:
+            reason = self.repository.pr_close_reason(submission_id)
+        except Exception as exc:
+            print(
+                f"[审查同步] record={record_id} submission={submission_id} "
+                f"关闭理由读取失败,理由留空待人工补充: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return ""
+        if not reason:
+            return CLOSE_REASON_FALLBACK
+        return reason
 
     def _warn_pr_missing(self, record_id: str, submission_id: str) -> None:
         """Git 上找不到该提交的 PR:一次性告警,行保持 审核中 等人工处理。

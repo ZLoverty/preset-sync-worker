@@ -41,10 +41,12 @@ _FIELD_TYPE_LABELS: dict[int, str] = {
 }
 
 # worker 可安全自动创建的缺失列:列名 -> (字段类型)
+# V2-P3:关闭理由 为文本列,缺失时随启动自动创建。
 AUTO_CREATE_FIELDS: dict[str, int] = {
     fields.SUBMISSION_ID: FIELD_TYPE_TEXT,
     fields.PR_URL: FIELD_TYPE_TEXT,
     fields.ERROR_MSG: FIELD_TYPE_TEXT,
+    fields.CLOSE_REASON: FIELD_TYPE_TEXT,
     fields.RETRY_COUNT: FIELD_TYPE_NUMBER,
 }
 
@@ -169,11 +171,17 @@ class BitableClient:
         """审查通过(PR 已合并):状态=已通过。保留 提交 ID/PR URL 作历史。"""
         self._mark_terminal(record_id, SubmissionStatus.APPROVED)
 
-    def mark_rejected(self, record_id: str) -> None:
-        """审查未通过(PR 关闭未合并):状态=已拒绝。保留 提交 ID/PR URL。"""
-        self._mark_terminal(record_id, SubmissionStatus.REJECTED)
+    def mark_rejected(self, record_id: str, close_reason: str = "") -> None:
+        """V2-P3:审查未通过(PR 关闭未合并):状态=已拒绝,回写关闭理由。
 
-    def _mark_terminal(self, record_id: str, status: SubmissionStatus) -> None:
+        保留 提交 ID/PR URL 作历史。close_reason 为空表示
+        未取到理由(Git 查询失败或确实无评论),留空由人工补充。
+        """
+        self._mark_terminal(record_id, SubmissionStatus.REJECTED, close_reason)
+
+    def _mark_terminal(
+        self, record_id: str, status: SubmissionStatus, close_reason: str = ""
+    ) -> None:
         self.update_record(
             record_id,
             {
@@ -181,6 +189,7 @@ class BitableClient:
                 fields.STATUS: status.value,
                 fields.ERROR_MSG: "",
                 fields.RETRY_COUNT: 0,
+                fields.CLOSE_REASON: close_reason,
             },
         )
 
@@ -230,13 +239,18 @@ class BitableClient:
         record_id: str,
         submission_id: str,
     ) -> None:
-        """claim:占用该记录并固定提交 ID(已请求=false,防止重复轮询)。"""
+        """claim:占用该记录并固定提交 ID(已请求=false,防止重复轮询)。
+
+        V2-P3:新一轮 claim 时清空上一轮留下的关闭理由(终态行点击
+        开启新一轮时,旧轮次若以「已拒绝」收尾会残留理由文本)。
+        """
         self.update_record(
             record_id,
             {
                 fields.REQUESTED: False,
                 fields.STATUS: SubmissionStatus.PROCESSING.value,
                 fields.SUBMISSION_ID: submission_id,
+                fields.CLOSE_REASON: "",
             },
         )
 

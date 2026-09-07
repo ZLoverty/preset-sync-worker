@@ -7,6 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from material_worker.domain.profile import MaterialProfile
@@ -237,16 +238,102 @@ class GitRepository:
         已合并的 PR state 通常为 closed 且 merged=true,需先判 merged;
         None 表示该 branch 上没有任何 PR。
         """
+        pull = self._find_pull_for_branch(submission_id)
+        if pull is None:
+            return None
+        if pull.get("merged") is True:
+            return "merged"
+        state = pull.get("state")
+        return "open" if state == "open" else "closed"
+
+    def _find_pull_for_branch(
+        self, submission_id: str
+    ) -> dict[str, Any] | None:
+        """该提交 branch 上第一个 PR 的原始记录(无则 None)。
+
+        V2-P3:关闭理由读取与状态判定共用同一次 PR 列表扫描。
+        """
         branch = self.branch_name_for(submission_id)
         for pull in self._list_pulls():
             head_ref = ((pull.get("head") or {}).get("ref")) or ""
-            if head_ref != branch:
-                continue
-            if pull.get("merged") is True:
-                return "merged"
-            state = pull.get("state")
-            return "open" if state == "open" else "closed"
+            if head_ref == branch:
+                return pull
         return None
+
+    def pr_close_reason(self, submission_id: str) -> str | None:
+        """V2-P3:该提交被关闭(未合并)PR 的关闭理由 = 关闭前最后一条评论正文。
+
+        候选评论 = 普通评论(issues/{number}/comments,GitHub/Gitea 同构,
+        系统事件不含在内)中 created_at 不晚于 PR closed_at 的正文非空评论;
+        取时间最晚的一条。无候选评论返回 None;读取失败抛异常,
+        由调用方记录日志(状态推进不受影响)。
+        """
+        pull = self._find_pull_for_branch(submission_id)
+        if pull is None or pull.get("merged") is True:
+            return None
+        if pull.get("state") != "closed":
+            return None
+        number = pull.get("number")
+        if number is None:
+            return None
+        closed_at = self._parse_rfc3339(pull.get("closed_at"))
+
+        candidates: list[tuple[datetime | None, str]] = []
+        for comment in self._list_issue_comments(int(number)):
+            body = str(comment.get("body") or "").strip()
+            if not body:
+                continue
+            created_at = self._parse_rfc3339(comment.get("created_at"))
+            if (
+                closed_at is not None
+                and created_at is not None
+                and created_at > closed_at
+            ):
+                continue  # 关闭之后的评论不是关闭理由
+            candidates.append((created_at, body))
+        if not candidates:
+            return None
+        # 时间最晚的一条;时间解析失败(罕见)的记录按最早兜底排序
+        candidates.sort(key=lambda item: item[0] or datetime.min)
+        return candidates[-1][1]
+
+    def _list_issue_comments(self, number: int) -> list[dict[str, Any]]:
+        """分页拉取该 PR(number)的普通评论(issue comments)。"""
+        collected: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode({"page": page, "per_page": 100})
+            path = (
+                f"/repos/{self._owner}/{self._repo}/issues/{number}/comments"
+                f"?{query}"
+            )
+            data = self._request("GET", path)
+            if not isinstance(data, list):
+                raise GitRepositoryError(
+                    f"评论列表响应格式异常: #{number}"
+                )
+            collected.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+        return collected
+
+    @staticmethod
+    def _parse_rfc3339(value: object) -> datetime | None:
+        """解析 Git API 的时间戳(RFC3339,可能带 Z 或 ±HH:MM)。
+
+        缺失/非法返回 None;naive 时间按 UTC 解释,保证可比。
+        """
+        if not value:
+            return None
+        text = str(value).strip()
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment
 
     def _list_pulls(self) -> list[dict[str, Any]]:
         """分页拉取本仓库全部 PR(state=all),返回原始 JSON 列表。"""

@@ -5,7 +5,10 @@ from material_worker.adapters.git import GitRepository, PullRequestResult
 from material_worker.domain.profile import MaterialProfile
 from material_worker.domain.status import SubmissionStatus
 from material_worker.exceptions import BitableError, PermanentError, RetryableError
-from material_worker.services.submission_service import SubmissionService
+from material_worker.services.submission_service import (
+    CLOSE_REASON_FALLBACK,
+    SubmissionService,
+)
 
 
 def make_profile(record_id="rec-1"):
@@ -54,6 +57,7 @@ class FakeBitable:
                 fields.REQUESTED: False,
                 fields.STATUS: SubmissionStatus.PROCESSING.value,
                 fields.SUBMISSION_ID: submission_id,
+                fields.CLOSE_REASON: "",  # V2-P3:新一轮 claim 清空旧理由
             }
         )
 
@@ -90,10 +94,12 @@ class FakeBitable:
                 fields.STATUS: SubmissionStatus.APPROVED.value,
                 fields.ERROR_MSG: "",
                 fields.RETRY_COUNT: 0,
+                fields.CLOSE_REASON: "",  # V2-P3:已通过 不写理由
             }
         )
 
-    def mark_rejected(self, record_id):
+    def mark_rejected(self, record_id, close_reason=""):
+        # V2-P3:close_reason 由 service 从 Git 侧同步(取不到则留空)
         self.marked.append((record_id, SubmissionStatus.REJECTED.value))
         self.records[record_id].update(
             {
@@ -101,6 +107,7 @@ class FakeBitable:
                 fields.STATUS: SubmissionStatus.REJECTED.value,
                 fields.ERROR_MSG: "",
                 fields.RETRY_COUNT: 0,
+                fields.CLOSE_REASON: close_reason,
             }
         )
 
@@ -127,6 +134,15 @@ class FakeGitRepository:
         # 审查同步用:submission_id -> "merged"/"open"/"closed";查不到返回 None
         self.pr_states: dict[str, str] = {}
         self.pr_state_errors: dict[str, Exception] = {}
+        # V2-P3:submission_id -> 关闭理由;缺省 None(无评论,service 写兜底)
+        self.close_reasons: dict[str, str | None] = {}
+        self.close_reason_errors: dict[str, Exception] = {}
+
+    def pr_close_reason(self, submission_id):
+        """V2-P3:取关闭理由(最后一条评论正文);查不到返回 None。"""
+        if submission_id in self.close_reason_errors:
+            raise self.close_reason_errors[submission_id]
+        return self.close_reasons.get(submission_id)
 
     def submit_profile(self, submission_id, profile):
         self.submit_calls.append(submission_id)
@@ -502,6 +518,86 @@ def test_review_sync_closed_unmerged_marks_rejected():
     row = bitable.records["rec-1"]
     assert row[fields.STATUS] == SubmissionStatus.REJECTED.value
     assert bitable.marked == [("rec-1", SubmissionStatus.REJECTED.value)]
+
+
+# ----------------------------------------------------------------------
+# V2-P3:PR 关闭理由同步(已拒绝 行回写 Git 关闭前最后一条评论正文)
+# ----------------------------------------------------------------------
+
+def test_review_sync_closed_writes_close_reason_from_git():
+    """关闭前最后一条评论正文作为关闭理由回写。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_states["sid-1"] = "closed"
+    repo.close_reasons["sid-1"] = "缺材料 ID,请补充后重提"
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.sync_reviewing_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REJECTED.value
+    assert row[fields.CLOSE_REASON] == "缺材料 ID,请补充后重提"
+
+
+def test_review_sync_closed_without_comments_writes_fallback():
+    """Git 侧无评论可作理由 -> 写兜底文案,状态照常落 已拒绝。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_states["sid-1"] = "closed"  # close_reasons 缺省 None(无评论)
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.sync_reviewing_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REJECTED.value
+    assert row[fields.CLOSE_REASON] == CLOSE_REASON_FALLBACK
+
+
+def test_review_sync_close_reason_fetch_failure_still_rejects_empty():
+    """理由读取失败(瞬时)不阻塞状态推进:落 已拒绝,理由留空人工补充。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_states["sid-1"] = "closed"
+    repo.close_reason_errors["sid-1"] = RetryableError("git down")
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.sync_reviewing_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REJECTED.value
+    assert row[fields.CLOSE_REASON] == ""
+
+
+def test_review_sync_merged_writes_no_close_reason():
+    """PR 合并 -> 已通过,不写关闭理由(即使 Git 侧有历史评论)。"""
+    bitable = FakeBitable("rec-1", reviewing_row())
+    repo = FakeGitRepository()
+    repo.pr_states["sid-1"] = "merged"
+    repo.close_reasons["sid-1"] = "不应出现"
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.sync_reviewing_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.APPROVED.value
+    assert row[fields.CLOSE_REASON] == ""
+
+
+def test_rejected_row_new_round_clears_close_reason():
+    """V2-P3:终态行开启新一轮(claim)时清空上一轮的关闭理由。"""
+    row = snapshot(
+        status=SubmissionStatus.REJECTED,
+        submission_id="sub-old",
+    )
+    row[fields.CLOSE_REASON] = "旧轮次的拒绝理由"
+    bitable = FakeBitable("rec-1", row)
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.CLOSE_REASON] == ""
 
 
 def test_review_sync_open_pr_keeps_reviewing():

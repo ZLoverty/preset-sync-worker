@@ -46,6 +46,8 @@ class FakeGitServer:
         self.file_shas: dict[str, str] = {}
         self.pulls: list[dict] = []
         self.pull_seq = 0
+        # V2-P3:PR(issue)普通评论 -> {pull number: [comment dict]}
+        self.issue_comments: dict[int, list[dict]] = {}
         self._counter = 0
         self.log: list[tuple[str, str, dict | None]] = []
         self.force_status: int | None = None
@@ -165,6 +167,13 @@ class FakeGitServer:
                 self.pulls.append(entry)
                 return self._ok(entry)
 
+        # V2-P3:PR 的普通评论(GitHub/Gitea 同构 /issues/{number}/comments)
+        if method == "GET" and rest.startswith("issues/") and rest.endswith(
+            "/comments"
+        ):
+            number = int(rest[len("issues/"):-len("/comments")])
+            return self._ok(self.issue_comments.get(number, []))
+
         return self._error(url, 404, {"message": f"unhandled {method} {rest}"})
 
 
@@ -278,16 +287,17 @@ def test_gitea_create_branch_uses_gitea_endpoint(gitea_repo):
     assert result.branch_name == "material/sid-9"
 
 
-def _add_pull(server, submission_id, state="open", merged=False):
-    server.pulls.append(
-        {
-            "head": {"ref": f"material/{submission_id}"},
-            "html_url": f"https://host.example/pulls/x-{submission_id}",
-            "number": len(server.pulls) + 1,
-            "state": state,
-            **({"merged": True} if merged else {}),
-        }
-    )
+def _add_pull(server, submission_id, state="open", merged=False, closed_at=None):
+    entry = {
+        "head": {"ref": f"material/{submission_id}"},
+        "html_url": f"https://host.example/pulls/x-{submission_id}",
+        "number": len(server.pulls) + 1,
+        "state": state,
+        **({"merged": True} if merged else {}),
+    }
+    if closed_at is not None:  # V2-P3:关闭理由需与 closed_at 比对
+        entry["closed_at"] = closed_at
+    server.pulls.append(entry)
 
 
 def test_submission_pr_state_open(github_repo, github_server):
@@ -315,6 +325,88 @@ def test_submission_pr_state_ignores_other_branches(github_repo, github_server):
 def test_submission_pr_state_none_when_no_pr(github_repo, github_server):
     _add_pull(github_server, "other", state="open")
     assert github_repo.submission_pr_state("sid-missing") is None
+
+
+# ----------------------------------------------------------------------
+# V2-P3:pr_close_reason(关闭理由 = 关闭前最后一条非空普通评论)
+# ----------------------------------------------------------------------
+def test_pr_close_reason_last_comment_before_close(github_repo, github_server):
+    _add_pull(
+        github_server, "sid-1", state="closed",
+        closed_at="2026-09-02T08:00:00Z",
+    )
+    github_server.issue_comments[1] = [
+        {"created_at": "2026-09-01T09:00:00Z", "body": "第一版问题太多"},
+        {"created_at": "2026-09-01T10:00:00Z", "body": "需要补充测试数据"},
+    ]
+    assert github_repo.pr_close_reason("sid-1") == "需要补充测试数据"
+
+
+def test_pr_close_reason_skips_empty_body_and_comments_after_close(
+    github_repo, github_server
+):
+    _add_pull(
+        github_server, "sid-1", state="closed",
+        closed_at="2026-09-02T08:00:00Z",
+    )
+    github_server.issue_comments[1] = [
+        {"created_at": "2026-09-02T09:00:00Z", "body": "关闭后的评论不算理由"},
+        {"created_at": "2026-09-01T10:00:00Z", "body": "   "},
+        {"created_at": "2026-09-01T11:00:00Z", "body": "缺材料 ID"},
+    ]
+    assert github_repo.pr_close_reason("sid-1") == "缺材料 ID"
+
+
+def test_pr_close_reason_compares_absolute_time_across_timezones(
+    github_repo, github_server
+):
+    """created_at 带不同时区偏移,排序须按绝对时刻而非字符串。"""
+    _add_pull(
+        github_server, "sid-1", state="closed",
+        closed_at="2026-09-02T00:00:00Z",
+    )
+    github_server.issue_comments[1] = [
+        # +08:00 的 07:59 = Z 的 前一日 23:59,仍早于关闭时刻
+        {"created_at": "2026-09-02T07:59:00+08:00", "body": "时区偏移的评论"},
+        {"created_at": "2026-09-01T23:30:00Z", "body": "Z 时区评论"},
+    ]
+    assert github_repo.pr_close_reason("sid-1") == "时区偏移的评论"
+
+
+def test_pr_close_reason_none_when_no_comments(github_repo, github_server):
+    _add_pull(
+        github_server, "sid-1", state="closed",
+        closed_at="2026-09-02T08:00:00Z",
+    )
+    assert github_repo.pr_close_reason("sid-1") is None
+
+
+def test_pr_close_reason_none_for_open_pr(github_repo, github_server):
+    _add_pull(github_server, "sid-1", state="open")
+    assert github_repo.pr_close_reason("sid-1") is None
+
+
+def test_pr_close_reason_none_for_merged_pr(github_repo, github_server):
+    # 已合并(merged=true)不是关闭未合并:不写理由
+    _add_pull(
+        github_server, "sid-1", state="closed", merged=True,
+        closed_at="2026-09-02T08:00:00Z",
+    )
+    github_server.issue_comments[1] = [
+        {"created_at": "2026-09-01T10:00:00Z", "body": "合并不需要理由"},
+    ]
+    assert github_repo.pr_close_reason("sid-1") is None
+
+
+def test_pr_close_reason_ignores_other_branches(github_repo, github_server):
+    _add_pull(
+        github_server, "other", state="closed",
+        closed_at="2026-09-02T08:00:00Z",
+    )
+    github_server.issue_comments[1] = [
+        {"created_at": "2026-09-01T10:00:00Z", "body": "别人的 PR 评论"},
+    ]
+    assert github_repo.pr_close_reason("sid-1") is None
 
 
 def test_repository_url_parsing():
