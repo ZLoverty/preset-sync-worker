@@ -20,6 +20,7 @@ class CountingService:
         self.calls: list[str] = []
         self.boom_on = boom_on
         self.sync_calls = 0
+        self.backfill_calls = 0  # V2-P2:JSON 附件导入每轮执行一次
 
     def process_record(self, record_id, fields_map):
         self.calls.append(record_id)
@@ -28,6 +29,10 @@ class CountingService:
 
     def sync_reviewing_rows(self):
         self.sync_calls += 1
+
+    def backfill_pending_json_rows(self):
+        """V2-P2:附件导入(草稿行解析反写),轮询每轮执行一次。"""
+        self.backfill_calls += 1
 
 
 def test_boot_runs_ensure_schema():
@@ -69,3 +74,15 @@ def test_poll_once_runs_review_sync():
     worker.poll_once()
 
     assert service.sync_calls == 2
+
+
+def test_poll_once_runs_json_backfill():
+    """V2-P2:每轮轮询还会跑一次 JSON 附件导入(草稿行解析反写)。"""
+    bitable = StubBitable([])
+    service = CountingService()
+    worker = MaterialWorker(bitable=bitable, submission_service=service)
+
+    worker.poll_once()
+    worker.poll_once()
+
+    assert service.backfill_calls == 2

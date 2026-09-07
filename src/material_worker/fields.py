@@ -21,6 +21,11 @@ MAX_VOL_SPEED = "最大体积流速"
 # 材料身份(可选;缺省用品名)
 MATERIAL_ID = "材料ID"
 
+# V2-P2:JSON 附件导入列(附件类型,worker 上传入口)。严格单 JSON:
+# 该列须恰好挂 1 个 .json 文件,worker 解析后反写标准字段,
+# 绝不因此自动提交 PR。过程照片(如有)另列存放,archive-only。
+PROFILE_JSON = "Profile JSON"
+
 # 提交元数据(P3:worker 回写)
 SUBMISSION_ID = "提交 ID"
 PR_URL = "PR URL"

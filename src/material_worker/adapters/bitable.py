@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import lark_oapi as lark
@@ -13,6 +14,7 @@ from lark_oapi.api.bitable.v1 import (
     ListAppTableRecordRequest,
     UpdateAppTableRecordRequest,
 )
+from lark_oapi.api.drive.v1 import DownloadMediaRequest
 
 from material_worker import fields
 from material_worker.domain.status import SubmissionStatus
@@ -41,12 +43,14 @@ _FIELD_TYPE_LABELS: dict[int, str] = {
 }
 
 # worker 可安全自动创建的缺失列:列名 -> (字段类型)
-# V2-P3:关闭理由 为文本列,缺失时随启动自动创建。
+# V2-P3:关闭理由 为文本列,缺失时随启动自动创建;
+# V2-P2:Profile JSON 为附件列,同样随启动自动创建(无选项,无需人工)。
 AUTO_CREATE_FIELDS: dict[str, int] = {
     fields.SUBMISSION_ID: FIELD_TYPE_TEXT,
     fields.PR_URL: FIELD_TYPE_TEXT,
     fields.ERROR_MSG: FIELD_TYPE_TEXT,
     fields.CLOSE_REASON: FIELD_TYPE_TEXT,
+    fields.PROFILE_JSON: FIELD_TYPE_ATTACHMENT,
     fields.RETRY_COUNT: FIELD_TYPE_NUMBER,
 }
 
@@ -66,6 +70,14 @@ _STATUS_REQUIRED_OPTIONS: list[str] = [s.value for s in SubmissionStatus]
 
 def _make_callable_error(exc: Exception) -> RetryableError:
     return RetryableError(f"Bitable 请求失败(网络/超时): {type(exc).__name__}: {exc}")
+
+
+@dataclass(frozen=True)
+class AttachmentItem:
+    """V2-P2:附件单元格里的一项(附件列原始值形态的适配层归一化)。"""
+
+    file_token: str
+    name: str
 
 
 class BitableClient:
@@ -157,6 +169,58 @@ class BitableClient:
             for record_id, record_fields in self.list_records()
             if record_fields.get(fields.REQUESTED) is True
         ]
+
+    # ------------------------------------------------------------------
+    # V2-P2:JSON 附件导入(附件单元格读取 + 媒体下载)
+    # ------------------------------------------------------------------
+    def attachment_items(
+        self, row_fields: dict[str, Any]
+    ) -> list[AttachmentItem]:
+        """把一行快照里的附件列原始值归一化为 AttachmentItem 列表。
+
+        附件列单元格在 API 返回里是 list[{file_token, name, …}];
+        空/缺列/形态异常一律返回空列表,由调用方按业务规则判定。
+        """
+        cell = row_fields.get(fields.PROFILE_JSON)
+        if not isinstance(cell, list):
+            return []
+        items: list[AttachmentItem] = []
+        for entry in cell:
+            if not isinstance(entry, dict):
+                continue
+            token = entry.get("file_token")
+            name = entry.get("name")
+            if token is None or name is None:
+                continue
+            items.append(AttachmentItem(file_token=str(token), name=str(name)))
+        return items
+
+    def download_attachment(self, file_token: str) -> bytes:
+        """下载附件(file_token)的原始字节(飞书媒体下载 API)。
+
+        网络/限流等瞬时问题抛 RetryableError;其余失败抛 BitableError,
+        由调用方按数据问题处理(不自动重试)。
+        """
+        request = (
+            DownloadMediaRequest.builder()
+            .file_token(file_token)
+            .build()
+        )
+        resp = self._call(
+            lambda: self.client.drive.v1.media.download(request),
+            "download attachment",
+        )
+        if resp.file is None:
+            raise BitableError("下载附件失败: 响应缺少文件内容")
+        try:
+            content = resp.file.read()
+        except Exception as exc:
+            raise BitableError(
+                f"下载附件失败,无法读取响应流: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(content, bytes):
+            raise BitableError("下载附件失败: 响应不是二进制内容")
+        return content
 
     def list_reviewing_records(self) -> list[tuple[str, dict[str, Any]]]:
         """取 状态=审核中 的行(审查同步用,本地过滤同 list_pending_records)。"""

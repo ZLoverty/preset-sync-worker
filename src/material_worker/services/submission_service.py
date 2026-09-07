@@ -23,6 +23,11 @@ from material_worker.exceptions import (
 # V2-P3:PR 被关闭(未合并)但 Git 侧无任何评论可作关闭理由时的兜底文案。
 CLOSE_REASON_FALLBACK = "PR 已关闭,未说明原因"
 
+# V2-P2:附件 JSON 大小上限(超出即判定数据问题,报错不解析)。
+JSON_ATTACHMENT_MAX_BYTES = 1_000_000
+# V2-P2:反写失败/解析失败写入「错误信息」的前缀,便于人工识别来源。
+JSON_PARSE_ERROR_PREFIX = "附件解析失败: "
+
 
 class SubmissionService:
     """业务编排层:输入校验 -> claim -> Git 幂等提交 -> 回写状态。
@@ -41,6 +46,10 @@ class SubmissionService:
         self.max_retries = max_retries
         # 无对应 PR 的「审核中」行只告警一次,避免每轮刷屏
         self._warned_no_pr: set[tuple[str, str]] = set()
+        # V2-P2:同一 (record_id, file_token) 只解析一次 —— 确定性失败
+        # (非法 JSON/超限/规则不符)不每轮重试刷屏;换附件(新 token)
+        # 或重启进程后自然重试。瞬时失败不入该集合,下轮自动重试。
+        self._json_parse_attempted: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------
     def sync_reviewing_rows(self) -> None:
@@ -158,6 +167,169 @@ class SubmissionService:
             f"submission={submission_id} 在 Git 上找不到对应 PR,"
             f"保持 审核中(若 PR 被手动删除,请人工处理该行)"
         )
+
+    # ------------------------------------------------------------------
+    # V2-P2:JSON 附件导入(上传 -> 下载 -> 解析 -> 只填空字段 -> 反写)
+    # ------------------------------------------------------------------
+    def backfill_pending_json_rows(self) -> None:
+        """扫描 JSON 附件待导入行并反写标准字段。
+
+        候选条件(§5.2 默认设计):
+        - 行尚未进入提交生命周期(状态列为空或 草稿);
+        - 「Profile JSON」附件列非空;
+        - 标准字段(品名/喷嘴温度/最大体积流速)至少有一个为空。
+
+        只填空单元格,用户已填内容绝不被附件覆盖;反写一次完成
+        (parse -> validate -> 单次 update_record),失败不产生部分脏数据;
+        成功只填表,**不自动提交 PR**(等用户点击提交按钮)。
+
+        确定性失败按 (record_id, file_token) 只尝试一次;瞬时失败
+        (网络/限流)不记录,下轮自动重试。单行异常不中断扫描。
+        """
+        for record_id, row_fields in self.bitable.list_records():
+            try:
+                self._backfill_one_json(record_id, row_fields)
+            except Exception as exc:
+                print(
+                    f"[记录异常-附件解析] record={record_id} "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    def _backfill_one_json(
+        self, record_id: str, row_fields: dict[str, Any]
+    ) -> None:
+        status_text = str(row_fields.get(fields.STATUS) or "").strip()
+        if status_text not in ("", SubmissionStatus.DRAFT.value):
+            return  # 已进入提交生命周期(处理中/审核中/终态…)不动
+        if not self._has_blank_standard_fields(row_fields):
+            return  # 标准字段已齐,视为人工填写,不解析
+
+        items = self.bitable.attachment_items(row_fields)
+        if not items:
+            return
+        # 严格单 JSON(R2):恰好 1 个附件且为 .json 文件
+        attempt_key = (record_id, items[0].file_token)
+        if attempt_key in self._json_parse_attempted:
+            return
+        if len(items) != 1:
+            self._json_parse_failure(
+                record_id,
+                attempt_key,
+                f"「{fields.PROFILE_JSON}」列须恰好挂 1 个 JSON 附件,"
+                f"当前有 {len(items)} 个(多附件/混入其它文件都按失败处理)",
+            )
+            return
+        item = items[0]
+        if not item.name.lower().endswith(".json"):
+            self._json_parse_failure(
+                record_id,
+                attempt_key,
+                f"附件不是 .json 文件: {item.name!r}",
+            )
+            return
+
+        try:
+            raw = self.bitable.download_attachment(item.file_token)
+        except RetryableError as exc:
+            self._json_parse_failure(
+                record_id,
+                None,
+                f"附件下载失败(瞬时,下轮自动重试): {exc}",
+                mark_attempted=False,
+            )
+            return
+        except Exception as exc:
+            self._json_parse_failure(
+                record_id,
+                attempt_key,
+                f"附件下载失败: {type(exc).__name__}: {exc}",
+            )
+            return
+
+        if len(raw) > JSON_ATTACHMENT_MAX_BYTES:
+            self._json_parse_failure(
+                record_id,
+                attempt_key,
+                f"附件超过大小上限 {JSON_ATTACHMENT_MAX_BYTES} 字节",
+            )
+            return
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            self._json_parse_failure(
+                record_id, attempt_key, f"附件不是 UTF-8 文本: {exc}"
+            )
+            return
+
+        try:
+            # 与 Bitable 手工填表共用同一 schema 与 validate(§5.3,无两套规则)
+            profile = MaterialProfile.parse_attachment_json(text)
+            profile.validate()
+        except ProfileValidationError as exc:
+            self._json_parse_failure(record_id, attempt_key, str(exc))
+            return
+
+        values: dict[str, Any] = {}
+
+        def _blank(col: str) -> bool:
+            value = row_fields.get(col)
+            return value is None or str(value).strip() == ""
+
+        if _blank(fields.NAME):
+            values[fields.NAME] = profile.name
+        if profile.id != profile.name and _blank(fields.MATERIAL_ID):
+            # 附件显式带 id 才写「材料ID」(缺省=品名时不必落列)
+            values[fields.MATERIAL_ID] = profile.id
+        if _blank(fields.NOZZLE_TEMP):
+            values[fields.NOZZLE_TEMP] = profile.nozzle_temperature
+        if _blank(fields.MAX_VOL_SPEED):
+            values[fields.MAX_VOL_SPEED] = profile.max_volumetric_speed
+        values[fields.ERROR_MSG] = ""  # 成功清掉历史解析错误
+
+        try:
+            # 一次原子反写:不产生部分脏数据
+            self.bitable.update_record(record_id, values)
+        except Exception as exc:
+            print(f"[严重错误] 附件反写失败 record={record_id}: {exc}")
+            return  # 不标记 attempted,下轮自愈重试
+        self._json_parse_attempted.add((record_id, item.file_token))
+        print(
+            f"[附件导入] record={record_id} 由附件 {item.name!r} "
+            f"反写标准字段完成(未自动提交,等用户点击提交)"
+        )
+
+    @staticmethod
+    def _has_blank_standard_fields(row_fields: dict[str, Any]) -> bool:
+        """标准必填字段(品名/喷嘴温度/最大体积流速)是否还有空位。"""
+        for col in (fields.NAME, fields.NOZZLE_TEMP, fields.MAX_VOL_SPEED):
+            value = row_fields.get(col)
+            if value is None or str(value).strip() == "":
+                return True
+        return False
+
+    def _json_parse_failure(
+        self,
+        record_id: str,
+        attempt_key: tuple[str, str] | None,
+        message: str,
+        *,
+        mark_attempted: bool = True,
+    ) -> None:
+        """解析失败统一收敛:写「错误信息」列 + 按需记 attempted + 打印。
+
+        成功路径绝不写入任何部分数据(§5.8:一次性反写)。
+        """
+        if mark_attempted and attempt_key is not None:
+            self._json_parse_attempted.add(attempt_key)
+        full = f"{JSON_PARSE_ERROR_PREFIX}{message}"
+        try:
+            self.bitable.update_record(record_id, {fields.ERROR_MSG: full})
+        except Exception as update_exc:
+            print(
+                f"[严重错误] 无法回写附件解析错误 record={record_id}: "
+                f"{update_exc}"
+            )
+        print(f"[附件解析失败] record={record_id}: {message}")
 
     # ------------------------------------------------------------------
     def process_record(

@@ -36,6 +36,10 @@ class MaterialWorker:
                     f"{type(exc).__name__}: {exc}"
                 )
 
+        # V2-P2:JSON 附件导入 —— 草稿行挂 Profile JSON 附件时解析反写
+        # 标准字段(只填空、不自动提交;失败写「错误信息」,不热循环)。
+        self.submission_service.backfill_pending_json_rows()
+
         # 审查同步:推进「审核中」行(PR 合并 -> 已通过,关闭未合并 -> 已拒绝)。
         # service 内已按行隔离;整体异常由 run_forever 兜底,不终止 daemon。
         self.submission_service.sync_reviewing_rows()

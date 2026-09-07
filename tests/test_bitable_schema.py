@@ -13,6 +13,7 @@ from material_worker import fields
 from material_worker.adapters.bitable import (
     AUTO_CREATE_FIELDS,
     BitableClient,
+    FIELD_TYPE_ATTACHMENT,
     FIELD_TYPE_CHECKBOX,
     FIELD_TYPE_MULTI_SELECT,
     FIELD_TYPE_NUMBER,
@@ -205,8 +206,15 @@ def test_auto_create_missing_text_fields_still_works():
 
 
 def test_auto_field_type_number_used_for_retry_count():
-    """自动列类型与既有约定一致(文本列 1/数字列 2)。"""
+    """自动列类型与既有约定一致(文本列 1/数字列 2)。
+
+    V2-P2:新增 Profile JSON 为附件列(17),其余自动列仍为文本。
+    """
     assert AUTO_CREATE_FIELDS[fields.RETRY_COUNT] == FIELD_TYPE_NUMBER
     for name, ftype in AUTO_CREATE_FIELDS.items():
-        if name != fields.RETRY_COUNT:
+        if name == fields.RETRY_COUNT:
+            continue
+        if name == fields.PROFILE_JSON:
+            assert ftype == FIELD_TYPE_ATTACHMENT
+        else:
             assert ftype == FIELD_TYPE_TEXT
