@@ -2,8 +2,9 @@ from datetime import datetime
 
 import pytest
 
+from helpers import make_profile as make_valid_profile
+
 from material_worker import fields
-from material_worker.domain.profile import MaterialProfile
 from material_worker.domain.status import InvalidTransitionError, SubmissionStatus
 from material_worker.domain.submission import (
     MaterialSubmission,
@@ -12,12 +13,7 @@ from material_worker.domain.submission import (
 
 
 def make_submission():
-    profile = MaterialProfile(
-        id="test",
-        name="Test PLA",
-        nozzle_temperature=220,
-        max_volumetric_speed=20,
-    )
+    profile = make_valid_profile()  # V2-P4:全必填字段构造
 
     return MaterialSubmission(
         submission_id="submission-1",

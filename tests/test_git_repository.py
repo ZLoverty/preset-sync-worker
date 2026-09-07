@@ -9,17 +9,16 @@ from urllib.request import Request
 import pytest
 
 from material_worker.adapters.git import GitRepository, PullRequestResult
-from material_worker.domain.profile import MaterialProfile
 from material_worker.exceptions import PermanentError, RetryableError
+
+from helpers import make_profile as make_valid_profile
+
+# V2-P4:默认档案(Test PLA/BBL/H2C/BambuStudio)的仓库内路径
+REPO_PATH = "preset/Test PLA/BBL/H2C/BambuStudio/Test PLA @BBL H2C.json"
 
 
 def make_profile():
-    return MaterialProfile(
-        id="Test PLA",
-        name="Test PLA",
-        nozzle_temperature=220,
-        max_volumetric_speed=20,
-    )
+    return make_valid_profile()
 
 
 class _Response:
@@ -210,10 +209,12 @@ def test_submit_profile_creates_pr(github_repo, github_server):
     assert result.branch_name == "material/sid-1"
     assert len(github_server.pulls) == 1
 
-    stored = github_server.contents["materials/Test_PLA.json"]
+    stored = github_server.contents[REPO_PATH]
     payload = json.loads(stored)
-    assert payload["name"] == "Test PLA"
-    assert payload["submission_id"] == "sid-1"
+    # V2-P4:name = worker 派生复合名(品名不单独成键);溯源键为 submission
+    assert payload["name"] == "Test PLA @BBL H2C"
+    assert payload["submission"] == "sid-1"
+    assert "submission_id" not in payload  # 旧键不再出现
 
 
 def test_submit_profile_idempotent_no_duplicate_pr(github_repo, github_server):
@@ -248,10 +249,8 @@ def test_partial_success_recovers_without_duplicate_content_commit(
 def test_no_changes_raises_permanent(github_repo, github_server):
     """内容与默认分支一致(例如已合并后无改动再次提交)-> 不建空 PR。"""
     profile = make_profile()
-    github_server.contents["materials/Test_PLA.json"] = profile.to_json(
-        submission_id="sid-1"
-    )
-    github_server.file_shas["materials/Test_PLA.json"] = "sha-existing"
+    github_server.contents[REPO_PATH] = profile.to_json(submission_id="sid-1")
+    github_server.file_shas[REPO_PATH] = "sha-existing"
 
     with pytest.raises(PermanentError):
         github_repo.submit_profile("sid-1", profile)

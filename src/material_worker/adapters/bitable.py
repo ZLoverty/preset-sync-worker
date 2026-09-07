@@ -43,14 +43,41 @@ _FIELD_TYPE_LABELS: dict[int, str] = {
 }
 
 # worker 可安全自动创建的缺失列:列名 -> (字段类型)
-# V2-P3:关闭理由 为文本列,缺失时随启动自动创建;
-# V2-P2:Profile JSON 为附件列,同样随启动自动创建(无选项,无需人工)。
+# 建表指南(新表):人工只需创建「状态」(单选)与「已请求」(复选框),
+# 其余文本/数字/附件列全部随 worker 启动自动补齐。
+# V2-P3:关闭理由 为文本列;V2-P2:Profile JSON 为附件列;
+# V2-P4:补入全部 V2-P4 数据列(结构/耗材参数,含 品名/材料ID 等 P1 列)。
 AUTO_CREATE_FIELDS: dict[str, int] = {
+    # 提交元数据(文本)
     fields.SUBMISSION_ID: FIELD_TYPE_TEXT,
     fields.PR_URL: FIELD_TYPE_TEXT,
     fields.ERROR_MSG: FIELD_TYPE_TEXT,
     fields.CLOSE_REASON: FIELD_TYPE_TEXT,
+    # 附件导入列
     fields.PROFILE_JSON: FIELD_TYPE_ATTACHMENT,
+    # 结构参数(文本)
+    fields.NAME: FIELD_TYPE_TEXT,
+    fields.BRAND: FIELD_TYPE_TEXT,
+    fields.MODEL: FIELD_TYPE_TEXT,
+    fields.SLICER: FIELD_TYPE_TEXT,
+    fields.MATERIAL_ID: FIELD_TYPE_TEXT,
+    fields.INHERITS: FIELD_TYPE_TEXT,
+    fields.SLICER_VERSION: FIELD_TYPE_TEXT,
+    fields.PM_METHOD_VERSION: FIELD_TYPE_TEXT,
+    fields.PI_CODE: FIELD_TYPE_TEXT,
+    # 耗材参数(数字)
+    fields.NOZZLE_TEMP: FIELD_TYPE_NUMBER,
+    fields.MAX_VOL_SPEED: FIELD_TYPE_NUMBER,
+    fields.FILAMENT_DENSITY: FIELD_TYPE_NUMBER,
+    fields.VITRIFICATION: FIELD_TYPE_NUMBER,
+    fields.FAN_COOLING_LAYER_TIME: FIELD_TYPE_NUMBER,
+    fields.FAN_MAX_SPEED: FIELD_TYPE_NUMBER,
+    fields.FAN_MIN_SPEED: FIELD_TYPE_NUMBER,
+    fields.SLOW_DOWN_LAYER_TIME: FIELD_TYPE_NUMBER,
+    fields.FLOW_RATIO: FIELD_TYPE_NUMBER,
+    fields.RETRACTION_LENGTH: FIELD_TYPE_NUMBER,
+    fields.PRESSURE_ADVANCE: FIELD_TYPE_NUMBER,
+    # 重试计数(数字)
     fields.RETRY_COUNT: FIELD_TYPE_NUMBER,
 }
 

@@ -28,7 +28,7 @@ worker 每轮拉取全表后按 `已请求 = true` **本地过滤**取待处理�
 
 ## 表格要求(建表指南)
 
-worker 启动时会自动补齐缺失的**文本/数字/附件**列(`提交 ID`/`PR URL`/`错误信息`/`关闭理由`/`Profile JSON`/`重试次数`),但以下两列类型特殊,**需人工创建**,缺失时 worker 启动即报错:
+worker 启动时会自动补齐缺失的**文本/数字/附件**列(提交元数据列、`Profile JSON` 附件列与全部结构/耗材参数列,见下),但以下两列类型特殊,**需人工创建**,缺失时 worker 启动即报错:
 
 | 列名 | 类型 | 说明 |
 |---|---|---|
@@ -37,14 +37,28 @@ worker 启动时会自动补齐缺失的**文本/数字/附件**列(`提交 ID`/
 
 > **列类型/选项校验(V2-P1)**:worker 启动时不仅检查 `状态` 列存在,还会按字段定义校验其**类型必须为单选**且**选项覆盖上述 7 个状态**,不符即启动失败并给出修复指引——飞书不支持直接把字段改成别的类型,需人工删除后用单选重建并重新配置选项;缺选项则人工在字段设置中补齐即可。
 
-其余列:`品名`(文本)、`喷嘴温度`(数字)、`最大体积流速`(数字),可选 `材料ID`(文本,用作档案 id 与文件名;缺省用品名)。
+### 数据列(V2-P4,一行 = 一种材料 × 一个机型配置)
+
+- **结构参数(文本,必填)**:`品名`/`品牌`/`机型`/`切片器`。
+  `切片器` 白名单:`BambuStudio`/`Orcaslicer`/`OrcaSlicer`/`ElegooSlicer`/`CrealityPrint`
+  (PrusaSlicer 产物为 `.ini` 预设,暂不支持,填写即报错)。
+- **耗材参数(数字,必填 10 项)**:`线材密度`(g/cm³)/`软化温度`(°C)/`冷却开启层时`(秒)/
+  `最大风扇速度`(%)/`最小风扇速度`(%)/`降速层时`(秒)/`喷嘴温度`(°C)/`流量比例`/
+  `最大体积流速`(mm³/s)/`回抽距离`(mm)——键名与取值范围对齐 BambuStudio 官方 key registry。
+- **可选**:
+  - `材料ID`(文本):只作备注,不再参与文件名;Git JSON 里 `id` 缺省用品名;
+  - `压力提前`(数字):仅第三方机器适用;`品牌`=BBL(官方机型)时填写即报错;
+  - `继承预设`/`切片器版本`/`调参方法版本`/`PI Code`(文本):留空则 Git JSON 省略对应键;
+    PI Code 是预留 seam(将来映射为产品名),当前仅建模存储、**不进入 Git JSON**。
+
+手工填表与 JSON 附件导入共用同一份 canonical schema(`MaterialProfile`),没有两套规则;必填缺失/数值越界一律逐字段报错并落 `错误信息`,不会产生 Git 提交。
 
 ## JSON 附件导入(V2-P2)
 
 用户可以把材料 Profile JSON 作为 `Profile JSON` 附件列上传(建行后挂附件即可,不必手动逐格输入);worker 每轮扫描**未进入提交生命周期**的行(状态空/`草稿`),满足「附件存在 + 标准字段有空位」就自动解析反写:
 
 - **严格单 JSON**:该列须恰好挂 1 个 `.json` 文件;无/多个 JSON、混入图片等其它文件一律报错,绝不静默选一个;
-- **键名规范**:附件 JSON 使用与 Git Profile 同构的英文 key(`id`/`name`/`nozzle_temperature`/`max_volumetric_speed`);未知键、worker 保留键(`submission_id`/`updated_at`)一律报错,解析器不做任何猜测;
+- **键名规范**:附件 JSON 使用与 Git Profile 同构的英文 key(V2-P4:全部 14 个必填键 + 可选键,键名同下节 Git 示例;数值为标量);未知键、worker 保留键(`submission`/`generated_at`/`filament_settings_id`/`enable_pressure_advance`)一律报错,解析器不做任何猜测;
 - **同一套校验**:附件 JSON 与手工填表共用 `MaterialProfile` + `validate()`(无两套业务规则);缺失必填、数值非法、越界都逐条报错;
 - **只填空格**:已填写的单元格绝不被附件覆盖;反写一次完成,失败不产生部分脏数据;
 - **失败呈现**:解析失败把原因(前缀「附件解析失败: …」)写入 `错误信息` 列,该附件(file_token)在 worker 进程内不重复尝试;替换附件或重启进程后自然重试,瞬时下载失败则下轮自动重试;
@@ -103,22 +117,40 @@ worker 启动时会自动补齐缺失的**文本/数字/附件**列(`提交 ID`/
 
 ## Git 仓库内容
 
-每次提交写一个文件(可重复提交/更新同一路径,由 PR 串联审查):
+每次提交写一个文件(可重复提交/更新同一路径,由 PR 串联审查);目录布局照搬 Polymaker-Preset 实况(V2-P4),品名/品牌/机型/切片器各为一段目录,空格与中文原样保留:
 
 ```
-materials/<材料 id 规范化>.json
+preset/<品名>/<品牌>/<机型>/<切片器>/<品名> @<品牌> <机型>.json
 ```
+
+文件内容 = 材料档案 + worker 派生的提交溯源(数值为标量,整数不写 `.0`;
+`name`/`filament_settings_id`/文件名主干 = worker 派生的复合名 `<品名> @<品牌> <机型>`,品名不单独成键;`pi_code` 等纯输入备注不进入文件):
 
 ```json
 {
   "id": "Test PLA",
-  "name": "Test PLA",
+  "name": "Test PLA @BBL H2C",
+  "brand": "BBL",
+  "model": "H2C",
+  "slicer": "BambuStudio",
+  "filament_settings_id": "Test PLA @BBL H2C",
+  "filament_density": 1.24,
+  "temperature_vitrification": 59,
+  "fan_cooling_layer_time": 100,
+  "fan_max_speed": 100,
+  "fan_min_speed": 100,
+  "slow_down_layer_time": 8,
   "nozzle_temperature": 220,
-  "max_volumetric_speed": 20,
-  "submission_id": "a1b2c3…",
-  "updated_at": "2026-09-06T12:00:00+08:00"
+  "filament_flow_ratio": 0.98,
+  "filament_max_volumetric_speed": 16,
+  "filament_retraction_length": 0.4,
+  "submission": "a1b2c3…",
+  "generated_at": "2026-09-06T12:00:00+08:00"
 }
 ```
+
+可选键按是否填写出现:`inherits`/`version`/`pm_method_version`;
+填了 `压力提前`(仅第三方机器)时额外输出 `pressure_advance` 与派生开关 `enable_pressure_advance: 1`。
 
 ## 运行与测试
 

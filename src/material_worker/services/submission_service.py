@@ -7,6 +7,8 @@ from material_worker import fields
 from material_worker.adapters.bitable import BitableClient
 from material_worker.adapters.git import GitRepository
 from material_worker.domain.profile import (
+    FIELD_SCHEMA,
+    REQUIRED_FIELDS,
     MaterialProfile,
     ProfileValidationError,
 )
@@ -172,12 +174,12 @@ class SubmissionService:
     # V2-P2:JSON 附件导入(上传 -> 下载 -> 解析 -> 只填空字段 -> 反写)
     # ------------------------------------------------------------------
     def backfill_pending_json_rows(self) -> None:
-        """扫描 JSON 附件待导入行并反写标准字段。
+        """扫描 JSON 附件待导入行并反写字段。
 
-        候选条件(§5.2 默认设计):
+        候选条件(§5.2 默认设计;V2-P4 起标准字段 = 全部必填 canonical 列):
         - 行尚未进入提交生命周期(状态列为空或 草稿);
         - 「Profile JSON」附件列非空;
-        - 标准字段(品名/喷嘴温度/最大体积流速)至少有一个为空。
+        - 必填字段(品名/品牌/机型/切片器 + 10 项耗材参数)至少有一个为空。
 
         只填空单元格,用户已填内容绝不被附件覆盖;反写一次完成
         (parse -> validate -> 单次 update_record),失败不产生部分脏数据;
@@ -271,19 +273,20 @@ class SubmissionService:
 
         values: dict[str, Any] = {}
 
-        def _blank(col: str) -> bool:
-            value = row_fields.get(col)
-            return value is None or str(value).strip() == ""
-
-        if _blank(fields.NAME):
-            values[fields.NAME] = profile.name
-        if profile.id != profile.name and _blank(fields.MATERIAL_ID):
-            # 附件显式带 id 才写「材料ID」(缺省=品名时不必落列)
-            values[fields.MATERIAL_ID] = profile.id
-        if _blank(fields.NOZZLE_TEMP):
-            values[fields.NOZZLE_TEMP] = profile.nozzle_temperature
-        if _blank(fields.MAX_VOL_SPEED):
-            values[fields.MAX_VOL_SPEED] = profile.max_volumetric_speed
+        # V2-P4:全字段反写 —— 由 canonical FIELD_SCHEMA 驱动,任一空白
+        # 单元格(必填或可选)都能由附件一次填充;已填内容绝不被覆盖。
+        # 「材料ID」只有附件显式给出且与品名不同才落列(缺省=品名不落)。
+        for f in FIELD_SCHEMA:
+            col = f.column
+            row_value = row_fields.get(col)
+            if row_value is not None and str(row_value).strip() != "":
+                continue  # 用户已填,不覆盖
+            value = getattr(profile, f.key)
+            if f.key == "id":
+                if profile.id is not None and profile.id != profile.name:
+                    values[col] = profile.id
+            elif value is not None:
+                values[col] = value
         values[fields.ERROR_MSG] = ""  # 成功清掉历史解析错误
 
         try:
@@ -300,9 +303,9 @@ class SubmissionService:
 
     @staticmethod
     def _has_blank_standard_fields(row_fields: dict[str, Any]) -> bool:
-        """标准必填字段(品名/喷嘴温度/最大体积流速)是否还有空位。"""
-        for col in (fields.NAME, fields.NOZZLE_TEMP, fields.MAX_VOL_SPEED):
-            value = row_fields.get(col)
+        """必填 canonical 字段是否还有空位(V2-P4:14 项全量必填)。"""
+        for f in REQUIRED_FIELDS:
+            value = row_fields.get(f.column)
             if value is None or str(value).strip() == "":
                 return True
         return False

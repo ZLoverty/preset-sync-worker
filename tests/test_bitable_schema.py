@@ -206,15 +206,32 @@ def test_auto_create_missing_text_fields_still_works():
 
 
 def test_auto_field_type_number_used_for_retry_count():
-    """自动列类型与既有约定一致(文本列 1/数字列 2)。
+    """自动列类型与既有约定一致(文本列 1/数字列 2/附件列 17)。
 
-    V2-P2:新增 Profile JSON 为附件列(17),其余自动列仍为文本。
+    V2-P2:Profile JSON 为附件列(17);
+    V2-P4:耗材参数列(喷嘴温度/线材密度/…/压力提前)与重试计数为数字列。
     """
     assert AUTO_CREATE_FIELDS[fields.RETRY_COUNT] == FIELD_TYPE_NUMBER
+    assert AUTO_CREATE_FIELDS[fields.PROFILE_JSON] == FIELD_TYPE_ATTACHMENT
+    number_columns = {
+        fields.RETRY_COUNT,
+        fields.NOZZLE_TEMP,
+        fields.MAX_VOL_SPEED,
+        fields.FILAMENT_DENSITY,
+        fields.VITRIFICATION,
+        fields.FAN_COOLING_LAYER_TIME,
+        fields.FAN_MAX_SPEED,
+        fields.FAN_MIN_SPEED,
+        fields.SLOW_DOWN_LAYER_TIME,
+        fields.FLOW_RATIO,
+        fields.RETRACTION_LENGTH,
+        fields.PRESSURE_ADVANCE,
+    }
+    assert number_columns <= set(AUTO_CREATE_FIELDS)  # 全部在自动建列清单内
     for name, ftype in AUTO_CREATE_FIELDS.items():
-        if name == fields.RETRY_COUNT:
-            continue
-        if name == fields.PROFILE_JSON:
+        if name in number_columns:
+            assert ftype == FIELD_TYPE_NUMBER, name
+        elif name == fields.PROFILE_JSON:
             assert ftype == FIELD_TYPE_ATTACHMENT
         else:
-            assert ftype == FIELD_TYPE_TEXT
+            assert ftype == FIELD_TYPE_TEXT, name

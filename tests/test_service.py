@@ -1,8 +1,16 @@
 """SubmissionService 测试:用 fake 的 BitableClient / GitRepository(P7 #35)。"""
+import json
+
+from helpers import (
+    DEFAULTS,
+    make_profile as make_valid_profile,
+    profile_attachment_json,
+    row_fields,
+)
+
 from material_worker import fields
 from material_worker.adapters.bitable import AttachmentItem, BitableClient
 from material_worker.adapters.git import GitRepository, PullRequestResult
-from material_worker.domain.profile import MaterialProfile
 from material_worker.domain.status import SubmissionStatus
 from material_worker.exceptions import BitableError, PermanentError, RetryableError
 from material_worker.services.submission_service import (
@@ -14,13 +22,9 @@ from material_worker.services.submission_service import (
 
 
 def make_profile(record_id="rec-1"):
-    return MaterialProfile(
-        id="test-pla",
-        name="Test PLA",
-        nozzle_temperature=220,
-        max_volumetric_speed=20,
-        source_record_id=record_id,
-    )
+    profile = make_valid_profile()
+    profile.source_record_id = record_id
+    return profile
 
 
 class FakeBitable:
@@ -205,13 +209,10 @@ class FakeGitRepository:
 
 def snapshot(record_id="rec-1", requested=True, status=None, submission_id=None,
              retry_count=None, **extra):
-    data = {
-        fields.NAME: "Test PLA",
-        fields.NOZZLE_TEMP: 220,
-        fields.MAX_VOL_SPEED: 20,
-        fields.REQUESTED: requested,
-        fields.STATUS: (status or SubmissionStatus.PENDING).value,
-    }
+    """V2-P4:全必填字段行(V2-P4 起必填 = 品名/品牌/机型/切片器 + 10 项耗材参数)。"""
+    data = row_fields()
+    data[fields.REQUESTED] = requested
+    data[fields.STATUS] = (status or SubmissionStatus.PENDING).value
     if submission_id is not None:
         data[fields.SUBMISSION_ID] = submission_id
     if retry_count is not None:
@@ -728,12 +729,12 @@ def test_exception_does_not_leak_from_service():
 
 # ----------------------------------------------------------------------
 # V2-P2:JSON 附件导入(草稿行 -> 下载解析 -> 只填空 -> 反写,不自动提交)
+# V2-P4:附件须含全部 14 个必填 canonical 键(英文 key 与表格同 schema)
 # ----------------------------------------------------------------------
 
-VALID_FILE = (
-    '{"id": "mat-1", "name": "Test PLA", '
-    '"nozzle_temperature": 220, "max_volumetric_speed": 20}\n'
-)
+def valid_file(**overrides):
+    """V2-P4:全必填键的合法附件 JSON(默认值同 helpers.DEFAULTS)。"""
+    return profile_attachment_json(**overrides) + "\n"
 
 
 def json_draft_row(attachment=None, status="", requested=False, **extra):
@@ -760,7 +761,7 @@ def test_json_backfill_happy_path_fills_blanks_and_stays_draft():
             **{fields.ERROR_MSG: "旧的解析错误"},
         ),
     )
-    bitable.attachments["tok-1"] = VALID_FILE.encode("utf-8")
+    bitable.attachments["tok-1"] = valid_file(id="mat-1").encode("utf-8")
     repo = FakeGitRepository()
     service = SubmissionService(bitable=bitable, repository=repo)
 
@@ -768,14 +769,39 @@ def test_json_backfill_happy_path_fills_blanks_and_stays_draft():
 
     row = bitable.records["rec-1"]
     assert row[fields.NAME] == "Test PLA"
-    assert row[fields.MATERIAL_ID] == "mat-1"  # 附件显式带 id 才落列
+    assert row[fields.BRAND] == "BBL"  # V2-P4:结构列一并由附件填入
+    assert row[fields.MODEL] == "H2C"
+    assert row[fields.SLICER] == "BambuStudio"
+    assert row[fields.MATERIAL_ID] == "mat-1"  # 附件显式带 id 且 != 品名才落列
     assert row[fields.NOZZLE_TEMP] == 220
-    assert row[fields.MAX_VOL_SPEED] == 20
+    assert row[fields.MAX_VOL_SPEED] == DEFAULTS["filament_max_volumetric_speed"]
     assert row[fields.ERROR_MSG] == ""
     assert row[fields.STATUS] in ("", SubmissionStatus.DRAFT.value)  # 仍草稿
     assert row[fields.REQUESTED] is False
     assert repo.submit_calls == []  # 绝不因附件自动提交
     assert service._json_parse_attempted == {("rec-1", "tok-1")}
+
+
+def test_json_backfill_fills_optional_columns_and_keeps_id_blank_by_default():
+    """V2-P4:可选 B 列(继承预设/切片器版本/调参方法版本/PI Code)在附件给出
+    且单元格空白时也反写;附件不带 id -> 材料ID 保持空(缺省=品名不落列)。"""
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = valid_file(
+        inherits="PolyTerra PLA @BBL H2C",
+        version="01.08.02.50",
+        pm_method_version="pm-v2.1",
+        pi_code="PT-PLA-001",
+    ).encode("utf-8")
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.backfill_pending_json_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.INHERITS] == "PolyTerra PLA @BBL H2C"
+    assert row[fields.SLICER_VERSION] == "01.08.02.50"
+    assert row[fields.PM_METHOD_VERSION] == "pm-v2.1"
+    assert row[fields.PI_CODE] == "PT-PLA-001"
+    assert row.get(fields.MATERIAL_ID) in (None, "")  # 无 id 键:材料ID 不落
 
 
 def test_json_backfill_only_fills_blank_cells_keeps_manual_values():
@@ -784,10 +810,10 @@ def test_json_backfill_only_fills_blank_cells_keeps_manual_values():
         "rec-1",
         json_draft_row(
             attachment=attach(),
-            **{fields.NAME: "已手填的品名"},  # 品名已填,喷嘴/流速留空
+            **{fields.NAME: "已手填的品名"},  # 品名已填,其余留空
         ),
     )
-    bitable.attachments["tok-1"] = VALID_FILE.encode("utf-8")
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
     service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
 
     service.backfill_pending_json_rows()
@@ -795,22 +821,18 @@ def test_json_backfill_only_fills_blank_cells_keeps_manual_values():
     row = bitable.records["rec-1"]
     assert row[fields.NAME] == "已手填的品名"
     assert row[fields.NOZZLE_TEMP] == 220
-    assert row[fields.MAX_VOL_SPEED] == 20
+    assert row[fields.MAX_VOL_SPEED] == DEFAULTS["filament_max_volumetric_speed"]
 
 
 def test_json_backfill_skips_non_candidates():
     """无附件/字段已齐/已在提交生命周期(审核中/失败…)的行一律不动。"""
     bitable = FakeBitable("rec-1", json_draft_row())  # 无附件
-    bitable.attachments["tok-1"] = VALID_FILE.encode("utf-8")
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
 
     # 字段已齐 + 挂着附件:视为人工填写完成,不解析
-    bitable.records["rec-2"] = json_draft_row(
-        attachment=attach(token="tok-1"),
-        **{
-            fields.NAME: "x",
-            fields.NOZZLE_TEMP: 200,
-            fields.MAX_VOL_SPEED: 10,
-        },
+    bitable.records["rec-2"] = dict(
+        row_fields(喷嘴温度=200, 最大体积流速=10),
+        **json_draft_row(attachment=attach(token="tok-1")),
     )
     # 审核中 行(在途提交)挂附件 + 空字段:不碰
     reviewing = json_draft_row(
@@ -824,13 +846,13 @@ def test_json_backfill_skips_non_candidates():
 
     for rid in ("rec-1", "rec-2", "rec-3"):
         row = bitable.records[rid]
-        assert row.get(fields.NOZZLE_TEMP) in (None, 200)
+        assert row.get(fields.NOZZLE_TEMP) in (None, 200, 10)
     assert bitable.download_tokens == []  # 一次下载都没发生
 
 
 def test_json_backfill_parse_failure_writes_error_and_no_partial_data():
     """非法 JSON(未知键)-> 写错误信息,不写任何部分数据,不热循环。"""
-    bad = '{"name": "x", "nozzle_temperature": 220, "cooling": 5}\n'
+    bad = valid_file(cooling=5)  # 在完整键上多加一个未建模键
     bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
     bitable.attachments["tok-1"] = bad.encode("utf-8")
     service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
@@ -846,6 +868,40 @@ def test_json_backfill_parse_failure_writes_error_and_no_partial_data():
     assert bitable.download_tokens == ["tok-1"]
 
 
+def test_json_backfill_missing_required_key_reports_all_missing():
+    """V2-P4:附件缺必填键 -> 一次性列出缺失(与表格同一 schema),不反写。"""
+    payload = json.loads(valid_file())
+    del payload["slicer"]
+    del payload["filament_flow_ratio"]
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = json.dumps(payload).encode("utf-8")
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.backfill_pending_json_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.ERROR_MSG].startswith(JSON_PARSE_ERROR_PREFIX)
+    assert "缺少必填字段" in row[fields.ERROR_MSG]
+    assert "slicer(切片器)" in row[fields.ERROR_MSG]
+    assert "filament_flow_ratio(流量比例)" in row[fields.ERROR_MSG]
+    assert row.get(fields.NAME) is None  # 无部分数据
+
+
+def test_json_backfill_attachment_goes_through_shared_validation():
+    """V2-P4:附件路径与手工填表共用同一 validate —— BBL+压力提前 一律拦。"""
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = valid_file(
+        brand="BBL", pressure_advance=0.05
+    ).encode("utf-8")
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.backfill_pending_json_rows()
+
+    row = bitable.records["rec-1"]
+    assert "官方机型" in row[fields.ERROR_MSG]
+    assert row.get(fields.PRESSURE_ADVANCE) is None  # 无部分数据
+
+
 def test_json_backfill_replaced_attachment_retries():
     """同一 token 失败后不再重试;用户替换附件(新 token)后自然重试。"""
     bitable = FakeBitable("rec-1", json_draft_row(attachment=attach(token="bad-1")))
@@ -858,7 +914,7 @@ def test_json_backfill_replaced_attachment_retries():
     )
 
     bitable.records["rec-1"][fields.PROFILE_JSON] = attach(token="good-1")
-    bitable.attachments["good-1"] = VALID_FILE.encode("utf-8")
+    bitable.attachments["good-1"] = valid_file().encode("utf-8")
     service.backfill_pending_json_rows()
 
     row = bitable.records["rec-1"]
@@ -876,8 +932,8 @@ def test_json_backfill_multiple_or_non_json_attachments_fail():
     )
     # 混入一个 .png
     bitable.records["rec-2"] = json_draft_row(attachment=attach(name="photo.png"))
-    bitable.attachments["tok-1"] = VALID_FILE.encode("utf-8")
-    bitable.attachments["tok-2"] = VALID_FILE.encode("utf-8")
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    bitable.attachments["tok-2"] = valid_file().encode("utf-8")
     bitable.attachments["photo.png"] = b"png"
     service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
 
@@ -918,7 +974,7 @@ def test_json_backfill_permanent_download_failure_no_retry():
 def test_json_backfill_retryable_download_failure_retries_next_poll():
     """瞬时下载失败(网络/限流)-> 写错误信息但不记 attempted,下轮重试。"""
     bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
-    bitable.attachments["tok-1"] = VALID_FILE.encode("utf-8")
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
     service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
 
     bitable.download_error = RetryableError("网络抖动")
@@ -934,9 +990,10 @@ def test_json_backfill_retryable_download_failure_retries_next_poll():
 
 def test_json_backfill_value_range_violation_writes_error():
     """附件数值越界 -> 共享 validate() 拦住,写错误信息,不反写。"""
-    bad = '{"name": "x", "nozzle_temperature": 9000, "max_volumetric_speed": 20}'
     bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
-    bitable.attachments["tok-1"] = bad.encode("utf-8")
+    bitable.attachments["tok-1"] = valid_file(
+        nozzle_temperature=9000
+    ).encode("utf-8")
     service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
 
     service.backfill_pending_json_rows()

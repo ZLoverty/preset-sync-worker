@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,7 +16,6 @@ from material_worker.exceptions import (
     RetryableError,
 )
 
-MATERIALS_DIR = "materials"
 REQUEST_TIMEOUT_SECONDS = 30
 
 # GitHub 对 PR list 的 head 过滤需要 owner:branch;Gitea 用 branch 名即可。
@@ -104,17 +102,14 @@ class GitRepository:
         """branch 名由 submission_id 唯一确定(P4 #20,幂等的基础)。"""
         return f"material/{submission_id}"
 
-    @staticmethod
-    def _safe_filename(name: str) -> str:
-        name = name.strip()
-        # 保留 unicode 单词字符/数字/-/_/. ;其余(含路径分隔符)统一为下划线
-        name = re.sub(r"[^\w.\-]+", "_", name, flags=re.UNICODE)
-        name = re.sub(r"_+", "_", name).strip("._")
-        return name or "material"
-
     def profile_path(self, profile: MaterialProfile) -> str:
-        """档案文件在仓库中的路径(布局: materials/<材料 id>.json)。"""
-        return f"{MATERIALS_DIR}/{self._safe_filename(profile.id)}.json"
+        """档案文件在仓库中的路径(纯函数,不触网)。
+
+        V2-P4:布局 = 照搬 Polymaker-Preset 实况(域内派生,见
+        MaterialProfile.repo_relative_path):目录段为 品名/品牌/机型/切片器,
+        均保留空格/中文原样(validate 已拒分隔符与保留字符)。
+        """
+        return profile.repo_relative_path()
 
     # ------------------------------------------------------------------
     # 低层 HTTP
@@ -528,7 +523,7 @@ class GitRepository:
         path = self.profile_path(profile)
         content = profile.to_json(submission_id=submission_id)
         message = (
-            f"[material] {profile.name} "
+            f"[material] {profile.repo_name()} "
             f"(submission {submission_id[:8]})"
         )
         self.commit(branch, message, path, content)
@@ -542,12 +537,13 @@ class GitRepository:
                 "材料内容与仓库默认分支一致,没有新的变更,未创建 PR"
             )
 
-        title = f"[材料提交] {profile.name}"
+        title = f"[材料提交] {profile.repo_name()}"
         body = (
-            f"材料: {profile.name}\n"
-            f"材料 ID: {profile.id}\n"
+            f"材料: {profile.repo_name()}\n"
+            f"品名: {profile.name}\n"
+            f"机型: {profile.brand} {profile.model} ({profile.slicer})\n"
             f"喷嘴温度: {profile.nozzle_temperature} °C\n"
-            f"最大体积流速: {profile.max_volumetric_speed} mm³/s\n\n"
+            f"最大体积流速: {profile.filament_max_volumetric_speed} mm³/s\n\n"
             f"Submission: {submission_id}\n"
         )
         try:
