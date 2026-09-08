@@ -319,32 +319,75 @@ def test_parse_attachment_json_accepts_numeric_strings():
     assert profile.nozzle_temperature == 220
 
 
+def test_parse_attachment_json_accepts_bambustudio_array_shapes():
+    """V2-P4:数值兼容 BambuStudio 系数组 —— 单元素或各值一致都取该值。"""
+    text = profile_attachment_json(
+        nozzle_temperature=["220"],
+        filament_retraction_length=["0.4", "0.4"],
+        filament_max_volumetric_speed=[16, 16],  # 数字数组也可
+    )
+    profile = MaterialProfile.parse_attachment_json(text)
+    assert profile.nozzle_temperature == 220
+    assert profile.filament_retraction_length == 0.4
+    assert profile.filament_max_volumetric_speed == 16
+
+
+def test_parse_attachment_json_rejects_inconsistent_array():
+    """多喷头值不一致(如 ['220','230'])-> 报错提示改单值,不静默挑选。"""
+    text = profile_attachment_json(nozzle_temperature=["220", "230"])
+    with pytest.raises(ProfileValidationError) as exc:
+        MaterialProfile.parse_attachment_json(text)
+    message = str(exc.value)
+    assert "各值不一致" in message
+    assert "nozzle_temperature(喷嘴温度)" in message
+
+
+def test_parse_attachment_json_rejects_nil_and_empty_array():
+    """含 nil/null/空 或空数组 -> 报错(真实文件里 'nil' 表示该喷头未设置)。"""
+    text = profile_attachment_json(filament_flow_ratio=["1.01", "nil"])
+    with pytest.raises(ProfileValidationError) as exc:
+        MaterialProfile.parse_attachment_json(text)
+    assert "nil" in str(exc.value) and "未设置值" in str(exc.value)
+
+    text = profile_attachment_json(filament_flow_ratio=[])
+    with pytest.raises(ProfileValidationError) as exc:
+        MaterialProfile.parse_attachment_json(text)
+    assert "空数组" in str(exc.value)
+
+
 def test_parse_attachment_json_trims_text_whitespace():
     text = profile_attachment_json(name="  Test PLA  ")
     profile = MaterialProfile.parse_attachment_json(text)
     assert profile.name == "Test PLA"
 
 
-def test_parse_attachment_json_rejects_unknown_key():
-    text = profile_attachment_json(cooling=5)
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json(text)
-    message = str(exc.value)
-    assert "cooling" in message
-    assert "未建模键" in message
+def test_parse_attachment_json_ignores_unknown_keys():
+    """V2-P4(用户确认):真实 BambuStudio 系文件的附加键一律忽略,
+    只要 14 个必填键能解析出来就认为合法。"""
+    text = profile_attachment_json(
+        cool_plate_temp=["35"],
+        filament_type="PLA",
+        **{"from": "User"},  # from 是保留字,只能经 ** 传
+        instantiation="true",
+        type="filament",
+    )
+    profile = MaterialProfile.parse_attachment_json(text)
+    assert profile.name == "Test PLA"
+    assert profile.nozzle_temperature == 220
 
 
-def test_parse_attachment_json_rejects_reserved_worker_keys():
-    """worker 生成/派生键(submission/generated_at/filament_settings_id/
-    enable_pressure_advance)附件不得携带覆盖。"""
-    for reserved in ("submission", "generated_at", "filament_settings_id",
-                     "enable_pressure_advance"):
-        text = profile_attachment_json(**{reserved: "fake"})
-        with pytest.raises(ProfileValidationError) as exc:
-            MaterialProfile.parse_attachment_json(text)
-        message = str(exc.value)
-        assert reserved in message
-        assert "保留键" in message
+def test_parse_attachment_json_ignores_reserved_worker_keys():
+    """V2-P4(用户确认):worker 生成/派生键(submission/generated_at/
+    filament_settings_id/enable_pressure_advance)由 worker 自己生成,
+    附件携带同名键不读取、不报错(如真实文件里的 filament_settings_id)。"""
+    text = profile_attachment_json(
+        submission="fake",
+        generated_at="fake",
+        filament_settings_id=["someone else @BBL H2C"],
+        enable_pressure_advance=1,
+    )
+    profile = MaterialProfile.parse_attachment_json(text)
+    assert profile.resolved_id == "Test PLA"  # 附件内容未被伪造键影响
 
 
 def test_parse_attachment_json_reports_all_missing_fields():

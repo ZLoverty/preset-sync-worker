@@ -13,13 +13,51 @@ class ProfileValidationError(ValueError):
 
 
 def _as_number(field_name: str, value: object) -> float:
-    """把表格/附件值(数字或数字字符串)转为 float,非法即抛校验错误。"""
+    """把表格值(数字或数字字符串)转为 float,非法即抛校验错误。"""
     try:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
         raise ProfileValidationError(
             f"字段「{field_name}」不是有效数字: {value!r}"
         ) from exc
+
+
+_NIL_TOKENS = frozenset({"", "nil", "null", "none"})
+
+
+def _attachment_number(field_name: str, raw: object) -> float:
+    """把附件 JSON 的数值解析为标量 float(V2-P4 放宽后)。
+
+    真实 BambuStudio 系文件把数值写成字符串数组(多喷头一行一个值),
+    上传的 JSON 可能是标量、数字字符串,也可能是数组:
+
+    - 数组各值(剔除后)解析出的数字全部一致 -> 取该值
+      (单元素 ['220']、多元素 ['220','220'] 都合法);
+    - 数组含 nil/null/空、或各值解析后不一致 -> 报错提示改为单值
+      或在表格手填(绝不静默挑一个喷头的值)。
+
+    输出侧仍是标量(见 to_dict —— 输入宽容、canonical 输出)。
+    """
+    if not isinstance(raw, list):
+        return _as_number(field_name, raw)
+    if not raw:
+        raise ProfileValidationError(f"附件字段「{field_name}」数值为空数组")
+    parsed: list[float] = []
+    for item in raw:
+        text = "" if item is None else str(item).strip()
+        if text.lower() in _NIL_TOKENS:
+            raise ProfileValidationError(
+                f"附件字段「{field_name}」数值含未设置值(nil/空),"
+                f"无法确定唯一数值: {raw!r}。请改为单值或在表格手填"
+            )
+        parsed.append(_as_number(field_name, item))
+    first = parsed[0]
+    if any(value != first for value in parsed[1:]):
+        raise ProfileValidationError(
+            f"附件字段「{field_name}」数值数组各值不一致(多喷头取值不同):"
+            f" {raw!r}。请改为单值或在表格手填"
+        )
+    return first
 
 
 def _blank(value: object) -> bool:
@@ -74,18 +112,6 @@ FIELD_SCHEMA: tuple[ProfileField, ...] = (
 REQUIRED_FIELDS: tuple[ProfileField, ...] = tuple(
     f for f in FIELD_SCHEMA if f.required
 )
-
-# Git JSON 里由 worker 生成/派生的键 —— 附件 JSON 携带即报错(保留键):
-#   submission / generated_at     提交溯源与生成时间(§9/§15)
-#   filament_settings_id          = name(派生,与 Git 文件名一致)
-#   enable_pressure_advance       = 填了 pressure_advance 时自动带
-_RESERVED_OUTPUT_KEYS: dict[str, str] = {
-    "submission": "提交溯源(worker 生成)",
-    "generated_at": "生成时间(worker 生成)",
-    "filament_settings_id": "导入 ID(worker 派生 = name)",
-    "enable_pressure_advance": "压力提前开关(worker 派生)",
-}
-
 
 def _label(key: str) -> str:
     for f in FIELD_SCHEMA:
@@ -235,25 +261,27 @@ class MaterialProfile:
         )
 
     # ------------------------------------------------------------------
-    # 附件 JSON -> domain(键名规范:R2-英文同构,不许猜;V2-P4 全字段)
+    # 附件 JSON -> domain(必填 14 键解析,其余键忽略;V2-P4 上传语义)
     # ------------------------------------------------------------------
     @classmethod
     def parse_attachment_json(cls, text: str) -> "MaterialProfile":
         """附件 JSON -> MaterialProfile(与 Bitable 手工填表同一 schema)。
 
-        规则:
-        - 必须是 JSON 对象;键名只接受 FIELD_SCHEMA 的英文 key;
-          未知键一律报错并列出;worker 保留键(submission/generated_at/
-          filament_settings_id/enable_pressure_advance)一并提示;
+        规则(V2-P4,用户确认的上传语义):
+        - 上传 JSON 一定是新建材料 —— 顶层必须是 JSON 对象;
         - 必填键 = 与表格相同的 14 项(name/brand/model/slicer + 10 项 A),
-          缺失一次性全部列出;
-        - 数值接受数字或数字字符串(标量);取值由 validate() 把关;
-        - 不做任何宽松猜测(不忽略未知键、不猜别名)。
+          只要这 14 项能解析出来就认为合法;缺失一次性全部列出;
+        - 其余键(真实 BambuStudio 系文件的附加键:plate 温度/filament_*
+          等)一律**忽略**,不做未知键报错;worker 派生键(submission/
+          generated_at/filament_settings_id/enable_pressure_advance)也
+          由 worker 自己生成,附件携带同名键不读取;
+        - 数值接受数字/数字字符串/字符串数组(单元素或各值一致,
+          见 _attachment_number);取值由 validate() 把关;
+        - 输出侧仍是 canonical 标量视图(to_dict,输入宽容、输出一致)。
         """
         if not text or not text.strip():
             raise ProfileValidationError("附件 JSON 为空")
 
-        allowed = {f.key for f in FIELD_SCHEMA}
         try:
             raw = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -264,21 +292,6 @@ class MaterialProfile:
         if not isinstance(raw, dict):
             raise ProfileValidationError(
                 f"附件 JSON 顶层必须是对象,实际是 {type(raw).__name__}"
-            )
-
-        unknown = sorted(set(raw) - allowed)
-        if unknown:
-            reserved = [
-                f"{k}({_RESERVED_OUTPUT_KEYS[k]})"
-                for k in unknown
-                if k in _RESERVED_OUTPUT_KEYS
-            ]
-            hints = f" (其中 worker 保留键: {', '.join(reserved)})" if reserved else ""
-            raise ProfileValidationError(
-                "附件 JSON 含未建模键: "
-                + ", ".join(_label(k) for k in unknown)
-                + f";只接受: {', '.join(sorted(allowed))}"
-                + hints
             )
 
         missing = [
@@ -299,7 +312,7 @@ class MaterialProfile:
                 values[f.key] = None
                 continue
             if f.numeric:
-                values[f.key] = _as_number(_label(f.key), raw_value)
+                values[f.key] = _attachment_number(_label(f.key), raw_value)
             else:
                 values[f.key] = str(raw_value).strip()
 
@@ -363,7 +376,7 @@ class MaterialProfile:
 
         name = worker 派生复合名;<品名> 不单独成键(用户确认);
         pi_code 仅建模存储、不进入 Git JSON(用户确认);数值标量,
-        整数不写成 x.0;保留键顺序稳定。
+        整数不写成 x.0;键顺序稳定。
         """
         data: dict[str, Any] = {
             "id": self.resolved_id,

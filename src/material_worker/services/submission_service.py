@@ -174,16 +174,19 @@ class SubmissionService:
     # V2-P2:JSON 附件导入(上传 -> 下载 -> 解析 -> 只填空字段 -> 反写)
     # ------------------------------------------------------------------
     def backfill_pending_json_rows(self) -> None:
-        """扫描 JSON 附件待导入行并反写字段。
+        """扫描 JSON 附件待导入行:反写字段并自动进入提交流程。
 
-        候选条件(§5.2 默认设计;V2-P4 起标准字段 = 全部必填 canonical 列):
+        候选条件(V2-P4,§5.2 上传语义 = 新建材料):
         - 行尚未进入提交生命周期(状态列为空或 草稿);
         - 「Profile JSON」附件列非空;
-        - 必填字段(品名/品牌/机型/切片器 + 10 项耗材参数)至少有一个为空。
+        - 必填字段(品名/品牌/机型/切片器 + 10 项耗材参数)至少有一个为空
+          (字段已齐的行视为人工填写完成,不解析、不自动提交)。
 
-        只填空单元格,用户已填内容绝不被附件覆盖;反写一次完成
-        (parse -> validate -> 单次 update_record),失败不产生部分脏数据;
-        成功只填表,**不自动提交 PR**(等用户点击提交按钮)。
+        解析与校验通过后(附件须含全部 14 个必填键,其余键忽略):
+        只填空单元格,用户已填内容绝不被附件覆盖;反写 + 置「已请求」
+        在一次原子 update 完成(V2-P4:上传 JSON = 新建材料意图,由下一轮
+        轮询自动 claim -> Git 提交 -> PR,与按钮同一路径),失败不产生
+        部分脏数据。解析/校验失败只写「错误信息」,不置请求、不提交。
 
         确定性失败按 (record_id, file_token) 只尝试一次;瞬时失败
         (网络/限流)不记录,下轮自动重试。单行异常不中断扫描。
@@ -289,6 +292,12 @@ class SubmissionService:
                 values[col] = value
         values[fields.ERROR_MSG] = ""  # 成功清掉历史解析错误
 
+        # V2-P4:上传 JSON = 新建材料意图(用户确认)—— 解析+校验通过说明
+        # 必填字段齐(validate 已把关),反写与置「已请求」在同一次原子
+        # update 完成:下一轮轮询走与按钮完全相同的常规提交流程
+        # (claim -> Git 幂等提交 -> 审核中 + PR)。失败路径不置请求,
+        # 修正附件后由新 token 自然重试。
+        values[fields.REQUESTED] = True
         try:
             # 一次原子反写:不产生部分脏数据
             self.bitable.update_record(record_id, values)
@@ -298,7 +307,7 @@ class SubmissionService:
         self._json_parse_attempted.add((record_id, item.file_token))
         print(
             f"[附件导入] record={record_id} 由附件 {item.name!r} "
-            f"反写标准字段完成(未自动提交,等用户点击提交)"
+            f"反写完成,字段已齐 -> 已置「已请求」,下轮自动进入提交流程"
         )
 
     @staticmethod

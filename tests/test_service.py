@@ -728,8 +728,9 @@ def test_exception_does_not_leak_from_service():
 
 
 # ----------------------------------------------------------------------
-# V2-P2:JSON 附件导入(草稿行 -> 下载解析 -> 只填空 -> 反写,不自动提交)
-# V2-P4:附件须含全部 14 个必填 canonical 键(英文 key 与表格同 schema)
+# JSON 附件导入(上传 = 新建材料,V2-P4 语义):
+# 草稿行 -> 下载解析(须含 14 个必填键,其余键忽略)-> 只填空 -> 反写 +
+# 置「已请求」-> 下一轮轮询自动 claim -> PR。失败只写错误信息,不提交。
 # ----------------------------------------------------------------------
 
 def valid_file(**overrides):
@@ -752,8 +753,8 @@ def attach(name="profile.json", token="tok-1"):
     return [{"file_token": token, "name": name}]
 
 
-def test_json_backfill_happy_path_fills_blanks_and_stays_draft():
-    """合法附件 JSON -> 只填空字段,清错误信息;不自动提交、不开 PR。"""
+def test_json_backfill_happy_path_fills_blanks_and_auto_submits():
+    """合法附件 JSON -> 只填空 + 置「已请求」;下一轮轮询自动开 PR。"""
     bitable = FakeBitable(
         "rec-1",
         json_draft_row(
@@ -765,7 +766,7 @@ def test_json_backfill_happy_path_fills_blanks_and_stays_draft():
     repo = FakeGitRepository()
     service = SubmissionService(bitable=bitable, repository=repo)
 
-    service.backfill_pending_json_rows()
+    service.backfill_pending_json_rows()  # 本轮轮询:只反写,不开 PR
 
     row = bitable.records["rec-1"]
     assert row[fields.NAME] == "Test PLA"
@@ -776,9 +777,18 @@ def test_json_backfill_happy_path_fills_blanks_and_stays_draft():
     assert row[fields.NOZZLE_TEMP] == 220
     assert row[fields.MAX_VOL_SPEED] == DEFAULTS["filament_max_volumetric_speed"]
     assert row[fields.ERROR_MSG] == ""
-    assert row[fields.STATUS] in ("", SubmissionStatus.DRAFT.value)  # 仍草稿
+    assert row[fields.STATUS] in ("", SubmissionStatus.DRAFT.value)  # 尚未 claim
+    assert row[fields.REQUESTED] is True  # V2-P4:自动进入提交流程
+    assert repo.submit_calls == []  # 本轮内还没走到 Git(下一轮才提交)
+
+    # 下一轮轮询:已请求 行走与按钮完全相同的常规流程 -> claim -> PR
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
     assert row[fields.REQUESTED] is False
-    assert repo.submit_calls == []  # 绝不因附件自动提交
+    assert row[fields.ERROR_MSG] == ""
+    assert len(repo.pull_requests) == 1
+    assert row[fields.PR_URL].endswith(row[fields.SUBMISSION_ID])
     assert service._json_parse_attempted == {("rec-1", "tok-1")}
 
 
@@ -822,6 +832,7 @@ def test_json_backfill_only_fills_blank_cells_keeps_manual_values():
     assert row[fields.NAME] == "已手填的品名"
     assert row[fields.NOZZLE_TEMP] == 220
     assert row[fields.MAX_VOL_SPEED] == DEFAULTS["filament_max_volumetric_speed"]
+    assert row[fields.REQUESTED] is True  # V2-P4:填齐后同样自动进入提交流程
 
 
 def test_json_backfill_skips_non_candidates():
@@ -847,12 +858,45 @@ def test_json_backfill_skips_non_candidates():
     for rid in ("rec-1", "rec-2", "rec-3"):
         row = bitable.records[rid]
         assert row.get(fields.NOZZLE_TEMP) in (None, 200, 10)
+        assert row.get(fields.REQUESTED) is False  # 无附件/已齐/在途:不自动提交
     assert bitable.download_tokens == []  # 一次下载都没发生
 
 
-def test_json_backfill_parse_failure_writes_error_and_no_partial_data():
-    """非法 JSON(未知键)-> 写错误信息,不写任何部分数据,不热循环。"""
-    bad = valid_file(cooling=5)  # 在完整键上多加一个未建模键
+def test_json_backfill_accepts_realistic_preset_style_json():
+    """V2-P4:真实 BambuStudio 系 JSON(14 必填键 + 一堆附加键/数组值)
+    -> 附加键忽略,反写 + 自动提交;不再因未建模键报错(用户 E2E 反馈)。"""
+    payload = valid_file(
+        cool_plate_temp=["35"],
+        cool_plate_temp_initial_layer=["35"],
+        eng_plate_temp=["55"],
+        filament_type="PLA",
+        filament_id="PMPL27",
+        filament_settings_id=["Test PLA @BBL H2C"],
+        **{"from": "User", "type": "filament", "instantiation": "true"},
+    )
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = payload.encode("utf-8")
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.backfill_pending_json_rows()
+
+    row = bitable.records["rec-1"]
+    assert row[fields.ERROR_MSG] == ""
+    assert row[fields.NAME] == "Test PLA"
+    assert row[fields.NOZZLE_TEMP] == 220
+    assert row[fields.REQUESTED] is True  # 自动进入提交流程
+    assert row.get(fields.MATERIAL_ID) in (None, "")  # filament_id 不落材料ID
+
+    # 下一轮轮询自动开 PR(证明上传即可达提交,无需按钮)
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+    assert bitable.records["rec-1"][fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert len(repo.pull_requests) == 1
+
+
+def test_json_backfill_invalid_value_writes_error_and_no_partial_data():
+    """数值数组值不一致 -> 写错误信息,不写任何部分数据,不热循环。"""
+    bad = valid_file(nozzle_temperature=["220", "230"])  # 多喷头取值不一致
     bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
     bitable.attachments["tok-1"] = bad.encode("utf-8")
     service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
@@ -862,9 +906,10 @@ def test_json_backfill_parse_failure_writes_error_and_no_partial_data():
 
     row = bitable.records["rec-1"]
     assert row[fields.ERROR_MSG].startswith(JSON_PARSE_ERROR_PREFIX)
-    assert "cooling" in row[fields.ERROR_MSG]
+    assert "各值不一致" in row[fields.ERROR_MSG]
     assert row.get(fields.NAME) is None  # 无部分数据
     assert row.get(fields.NOZZLE_TEMP) is None
+    assert row[fields.REQUESTED] is False  # 失败不自动提交
     assert bitable.download_tokens == ["tok-1"]
 
 
@@ -920,6 +965,7 @@ def test_json_backfill_replaced_attachment_retries():
     row = bitable.records["rec-1"]
     assert row[fields.NAME] == "Test PLA"
     assert row[fields.ERROR_MSG] == ""
+    assert row[fields.REQUESTED] is True  # 替换后成功 -> 自动提交
     assert bitable.download_tokens == ["bad-1", "good-1"]
 
 
@@ -985,6 +1031,7 @@ def test_json_backfill_retryable_download_failure_retries_next_poll():
     service.backfill_pending_json_rows()
 
     assert bitable.records["rec-1"][fields.NAME] == "Test PLA"
+    assert bitable.records["rec-1"][fields.REQUESTED] is True  # 恢复后自动提交
     assert bitable.download_tokens == ["tok-1", "tok-1"]
 
 
@@ -1001,3 +1048,4 @@ def test_json_backfill_value_range_violation_writes_error():
     row = bitable.records["rec-1"]
     assert "喷嘴温度" in row[fields.ERROR_MSG]
     assert row.get(fields.NOZZLE_TEMP) is None
+    assert row[fields.REQUESTED] is False  # 校验失败不自动提交
