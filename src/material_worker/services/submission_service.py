@@ -200,6 +200,79 @@ class SubmissionService:
                     f"{type(exc).__name__}: {exc}"
                 )
 
+    # ------------------------------------------------------------------
+    # V2-P4:附件解析核心(反写轮与 claim 路径共用同一规则/解析/只填空)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _single_json_item(items: list[Any]) -> Any:
+        """严格单 JSON(R2):恰好 1 个附件且为 .json 文件,违规抛异常。"""
+        if len(items) != 1:
+            raise _AttachmentImportError(
+                f"「{fields.PROFILE_JSON}」列须恰好挂 1 个 JSON 附件,"
+                f"当前有 {len(items)} 个(多附件/混入其它文件都按失败处理)"
+            )
+        item = items[0]
+        if not item.name.lower().endswith(".json"):
+            raise _AttachmentImportError(f"附件不是 .json 文件: {item.name!r}")
+        return item
+
+    def _download_and_parse_json(self, item: Any) -> MaterialProfile:
+        """下载 -> 大小/UTF-8 -> 解析 + 校验(与手工填表共用 schema)。
+
+        确定性失败(规则/超限/编码/下载永久失败/解析/校验)抛
+        _AttachmentImportError,消息即完整提示(无前缀);
+        仅瞬时下载失败抛 RetryableError,由调用方按瞬态处理。
+        """
+        try:
+            raw = self.bitable.download_attachment(item.file_token)
+        except RetryableError:
+            raise
+        except Exception as exc:
+            raise _AttachmentImportError(
+                f"附件下载失败: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if len(raw) > JSON_ATTACHMENT_MAX_BYTES:
+            raise _AttachmentImportError(
+                f"附件超过大小上限 {JSON_ATTACHMENT_MAX_BYTES} 字节"
+            )
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _AttachmentImportError(
+                f"附件不是 UTF-8 文本: {exc}"
+            ) from exc
+
+        try:
+            profile = MaterialProfile.parse_attachment_json(text)
+            profile.validate()
+        except ProfileValidationError as exc:
+            raise _AttachmentImportError(str(exc)) from exc
+        return profile
+
+    @staticmethod
+    def _attachment_fill_values(
+        row_fields: dict[str, Any], profile: MaterialProfile
+    ) -> dict[str, Any]:
+        """附件 -> 只填空单元格的全字段反写值(canonical FIELD_SCHEMA 驱动)。
+
+        已填内容绝不被覆盖;「材料ID」只有附件显式给出且与品名不同才落列
+        (缺省=品名不落)。反写值不含 REQUESTED/ERROR_MSG,由调用方决定。
+        """
+        values: dict[str, Any] = {}
+        for f in FIELD_SCHEMA:
+            col = f.column
+            row_value = row_fields.get(col)
+            if row_value is not None and str(row_value).strip() != "":
+                continue  # 用户已填,不覆盖
+            value = getattr(profile, f.key)
+            if f.key == "id":
+                if profile.id is not None and profile.id != profile.name:
+                    values[col] = profile.id
+            elif value is not None:
+                values[col] = value
+        return values
+
     def _backfill_one_json(
         self, record_id: str, row_fields: dict[str, Any]
     ) -> None:
@@ -216,25 +289,9 @@ class SubmissionService:
         attempt_key = (record_id, items[0].file_token)
         if attempt_key in self._json_parse_attempted:
             return
-        if len(items) != 1:
-            self._json_parse_failure(
-                record_id,
-                attempt_key,
-                f"「{fields.PROFILE_JSON}」列须恰好挂 1 个 JSON 附件,"
-                f"当前有 {len(items)} 个(多附件/混入其它文件都按失败处理)",
-            )
-            return
-        item = items[0]
-        if not item.name.lower().endswith(".json"):
-            self._json_parse_failure(
-                record_id,
-                attempt_key,
-                f"附件不是 .json 文件: {item.name!r}",
-            )
-            return
-
         try:
-            raw = self.bitable.download_attachment(item.file_token)
+            item = self._single_json_item(items)
+            profile = self._download_and_parse_json(item)
         except RetryableError as exc:
             self._json_parse_failure(
                 record_id,
@@ -243,53 +300,11 @@ class SubmissionService:
                 mark_attempted=False,
             )
             return
-        except Exception as exc:
-            self._json_parse_failure(
-                record_id,
-                attempt_key,
-                f"附件下载失败: {type(exc).__name__}: {exc}",
-            )
-            return
-
-        if len(raw) > JSON_ATTACHMENT_MAX_BYTES:
-            self._json_parse_failure(
-                record_id,
-                attempt_key,
-                f"附件超过大小上限 {JSON_ATTACHMENT_MAX_BYTES} 字节",
-            )
-            return
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            self._json_parse_failure(
-                record_id, attempt_key, f"附件不是 UTF-8 文本: {exc}"
-            )
-            return
-
-        try:
-            # 与 Bitable 手工填表共用同一 schema 与 validate(§5.3,无两套规则)
-            profile = MaterialProfile.parse_attachment_json(text)
-            profile.validate()
-        except ProfileValidationError as exc:
+        except _AttachmentImportError as exc:
             self._json_parse_failure(record_id, attempt_key, str(exc))
             return
 
-        values: dict[str, Any] = {}
-
-        # V2-P4:全字段反写 —— 由 canonical FIELD_SCHEMA 驱动,任一空白
-        # 单元格(必填或可选)都能由附件一次填充;已填内容绝不被覆盖。
-        # 「材料ID」只有附件显式给出且与品名不同才落列(缺省=品名不落)。
-        for f in FIELD_SCHEMA:
-            col = f.column
-            row_value = row_fields.get(col)
-            if row_value is not None and str(row_value).strip() != "":
-                continue  # 用户已填,不覆盖
-            value = getattr(profile, f.key)
-            if f.key == "id":
-                if profile.id is not None and profile.id != profile.name:
-                    values[col] = profile.id
-            elif value is not None:
-                values[col] = value
+        values = self._attachment_fill_values(row_fields, profile)
         values[fields.ERROR_MSG] = ""  # 成功清掉历史解析错误
 
         # V2-P4:上传 JSON = 新建材料意图(用户确认)—— 解析+校验通过说明
@@ -344,6 +359,55 @@ class SubmissionService:
         print(f"[附件解析失败] record={record_id}: {message}")
 
     # ------------------------------------------------------------------
+    # V2-P4:claim 路径的附件导入 —— 点「请求」时必填仍空 + 挂 JSON 附件,
+    # 当场先按附件反写再提交(上传=新建材料),不依赖反写轮先跑。
+    # ------------------------------------------------------------------
+    def _import_json_at_claim(
+        self,
+        record_id: str,
+        fields_snapshot: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """按附件反写空白必填字段并把反写内容一次落表(不置「已请求」)。
+
+        与反写轮(_backfill_one_json)共用 _single_json_item /
+        _download_and_parse_json / _attachment_fill_values,「只填空、不覆盖」
+        一致。返回反写值(供调用方合并出 profile);无附件返回 None。
+
+        - 附件确定性失败(规则/解析/校验/下载永久失败)-> 抛 _AttachmentFailure
+          (消息带「附件解析失败:」前缀),由调用方永久失败处理;
+        - 瞬时下载失败 -> 抛 RetryableError(已带前缀),由调用方自动重试;
+        - 反写落表失败 -> 原样上抛,调用方按未知异常走有限自动重试。
+        """
+        items = self.bitable.attachment_items(fields_snapshot)
+        if not items:
+            return None
+        try:
+            item = self._single_json_item(items)
+            profile = self._download_and_parse_json(item)
+        except RetryableError as exc:
+            raise RetryableError(
+                f"{JSON_PARSE_ERROR_PREFIX}附件下载失败(瞬时,下轮自动重试): "
+                f"{exc}"
+            ) from exc
+        except _AttachmentImportError as exc:
+            raise _AttachmentFailure(f"{JSON_PARSE_ERROR_PREFIX}{exc}") from exc
+
+        values = self._attachment_fill_values(fields_snapshot, profile)
+        values[fields.ERROR_MSG] = ""  # 反写成功清掉历史错误
+        try:
+            # 先落表再继续提交:成功后行内数据与提交内容一致,失败路径
+            # (如 Git 永久失败)也不丢反写结果;该 update 失败交由调用方重试。
+            self.bitable.update_record(record_id, values)
+        except Exception:
+            print(f"[严重错误] 提交前附件反写失败 record={record_id}: 下轮自动重试")
+            raise
+        print(
+            f"[附件导入(提交路径)] record={record_id} 由附件 {item.name!r} "
+            f"反写完成 -> 继续常规提交"
+        )
+        return values
+
+    # ------------------------------------------------------------------
     def process_record(
         self,
         record_id: str,
@@ -351,7 +415,9 @@ class SubmissionService:
     ) -> None:
         """处理一条 已请求=true 的记录(P0 #3 触发链路不变)。
 
-        - 数据不完整/非法:直接永久失败,绝不进入 Git(P0 #5);
+        - 数据不完整/非法:直接永久失败,绝不进入 Git(P0 #5);其中必填
+          字段有空位但挂有「Profile JSON」附件时,先按附件反写再校验
+          (V2-P4 上传=新建,点按钮与纯上传收敛到同一提交流程);
         - 之后任何临时失败都会把 已请求 重新置 true,由下一轮轮询自动重试,
           重试次数超过上限或遇永久错误才置为 失败。
         - 审核中(在途提交)行的重复触发不进入本轮完整流程,按 PR 实况
@@ -370,11 +436,38 @@ class SubmissionService:
             # 审核中 但无提交 ID:没有在途提交可对照,落入常规流程开新一轮。
 
         # 1) 解析 + 校验(claim 之前完成,坏数据不占坑)
+        #    V2-P4:必填有空位且附件在场 -> 先反写(只填空)合并进快照,再走
+        #    常规校验;附件问题 -> 永久失败(前缀「附件解析失败:」),瞬时
+        #    下载/反写失败 -> 有限自动重试,绝不占坑或静默跳过。
         try:
+            if self._has_blank_standard_fields(fields_snapshot):
+                fills = self._import_json_at_claim(record_id, fields_snapshot)
+                if fills:
+                    fields_snapshot = {**fields_snapshot, **fills}
             profile = MaterialProfile.from_bitable_record(record_id, fields_snapshot)
             profile.validate()
+        except _AttachmentFailure as exc:
+            self._fail_permanently(record_id, str(exc))
+            return
+        except RetryableError as exc:
+            self._handle_transient_failure(
+                record_id,
+                resolve_submission_id(fields_snapshot),
+                self._snapshot_retry_count(fields_snapshot),
+                str(exc),
+            )
+            return
         except ProfileValidationError as exc:
             self._fail_permanently(record_id, f"数据校验失败: {exc}")
+            return
+        except Exception as exc:
+            # 附件反写落表失败等未知异常:走有限自动重试(P6 #27 同策略)
+            self._handle_transient_failure(
+                record_id,
+                resolve_submission_id(fields_snapshot),
+                self._snapshot_retry_count(fields_snapshot),
+                f"{type(exc).__name__}: {exc}",
+            )
             return
 
         # 2) 提交 ID:复用组(待处理/处理中/失败/审核中)复用既有 ID,
@@ -544,3 +637,15 @@ class SubmissionService:
 
 class _ClaimLost(Exception):
     """内部信号:claim 校验发现记录已被他人占用,本次不处理。"""
+
+
+class _AttachmentImportError(Exception):
+    """附件确定性问题的内部信号(规则/超限/编码/下载永久失败/解析/校验)。
+
+    消息即完整提示文案(无前缀);由调用方(反写轮写「错误信息」列 /
+    claim 路径转终态失败)各自收敛。
+    """
+
+
+class _AttachmentFailure(Exception):
+    """claim 路径附件确定性失败的终态信号(消息已带「附件解析失败:」前缀)。"""

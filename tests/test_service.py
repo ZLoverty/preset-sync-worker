@@ -1049,3 +1049,186 @@ def test_json_backfill_value_range_violation_writes_error():
     assert "喷嘴温度" in row[fields.ERROR_MSG]
     assert row.get(fields.NOZZLE_TEMP) is None
     assert row[fields.REQUESTED] is False  # 校验失败不自动提交
+
+
+# ----------------------------------------------------------------------
+# V2-P4:claim 路径的附件导入 —— 点「请求」时必填仍空 + 挂 JSON 附件,
+# process_record 先按附件反写再提交(上传=新建,用户 E2E 反馈:点按钮先行
+# 时不再落入「缺少必填字段」永久失败)。附件问题 -> 永久失败带前缀。
+# ----------------------------------------------------------------------
+
+def test_requested_row_with_attachment_fills_and_submits_in_one_call():
+    """空行点「请求」+ 挂合法 JSON:同一次 process_record 内反写 + 开 PR。"""
+    bitable = FakeBitable(
+        "rec-1", json_draft_row(attachment=attach(), requested=True)
+    )
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.NAME] == "Test PLA"  # 反写已落表
+    assert row[fields.BRAND] == "BBL"
+    assert row[fields.NOZZLE_TEMP] == 220
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.REQUESTED] is False
+    assert row[fields.ERROR_MSG] == ""
+    assert len(repo.pull_requests) == 1  # 一次点击直达 PR
+    assert bitable.download_tokens == ["tok-1"]
+
+
+def test_requested_row_partial_manual_values_not_overwritten_at_claim():
+    """claim 反写同样只填空:用户已填的单元格不被附件覆盖。"""
+    bitable = FakeBitable(
+        "rec-1",
+        json_draft_row(
+            attachment=attach(),
+            requested=True,
+            **{fields.NAME: "手工品名"},
+        ),
+    )
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.NAME] == "手工品名"  # 附件里的 name 未覆盖
+    assert row[fields.NOZZLE_TEMP] == 220  # 其余空白由附件填充
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert len(repo.pull_requests) == 1
+
+
+def test_requested_row_invalid_attachment_fails_with_parse_error():
+    """附件本身非法(数组值不一致)-> 永久失败带「附件解析失败:」,无部分数据。"""
+    bitable = FakeBitable(
+        "rec-1", json_draft_row(attachment=attach(), requested=True)
+    )
+    bitable.attachments["tok-1"] = valid_file(
+        nozzle_temperature=["220", "230"]
+    ).encode("utf-8")
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.FAILED.value
+    assert row[fields.REQUESTED] is False
+    assert row[fields.ERROR_MSG].startswith(JSON_PARSE_ERROR_PREFIX)
+    assert "各值不一致" in row[fields.ERROR_MSG]
+    assert row.get(fields.NAME) is None  # 反写未落任何部分数据
+    assert repo.submit_calls == []
+
+
+def test_requested_row_multi_attachment_fails_at_claim():
+    """claim 路径同样执行严格单 JSON(R2),不静默选一个。"""
+    bitable = FakeBitable(
+        "rec-1",
+        json_draft_row(
+            attachment=attach() + attach(token="tok-2"), requested=True
+        ),
+    )
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    bitable.attachments["tok-2"] = valid_file().encode("utf-8")
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.FAILED.value
+    assert "恰好挂 1 个" in row[fields.ERROR_MSG]
+    assert bitable.download_tokens == []  # 规则不符,连下载都不发生
+
+
+def test_requested_row_blank_without_attachment_fails_with_guidance():
+    """必填空 + 无附件可导(真·空行点按钮)-> 保持原语义:校验失败给指引。"""
+    bitable = FakeBitable("rec-1", json_draft_row(requested=True))
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.FAILED.value
+    assert "数据校验失败" in row[fields.ERROR_MSG]
+    assert "缺少必填字段" in row[fields.ERROR_MSG]
+    assert repo.submit_calls == []
+
+
+def test_requested_row_transient_download_failure_retries_then_succeeds():
+    """claim 时附件下载瞬时失败 -> 有限自动重试(不终态),恢复后一次成功。"""
+    bitable = FakeBitable(
+        "rec-1", json_draft_row(attachment=attach(), requested=True)
+    )
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    bitable.download_error = RetryableError("网络抖动")
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.PROCESSING.value  # 非终态
+    assert row[fields.REQUESTED] is True  # 下轮自动重试
+    assert row[fields.RETRY_COUNT] == 1
+    assert "自动重试" in row[fields.ERROR_MSG]
+    assert repo.submit_calls == []
+
+    bitable.download_error = None  # 故障恢复
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.NAME] == "Test PLA"
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert row[fields.ERROR_MSG] == ""
+    assert len(repo.pull_requests) == 1
+    assert bitable.download_tokens == ["tok-1", "tok-1"]
+
+
+def test_requested_row_complete_fields_never_touches_attachment():
+    """必填字段已齐的行点「请求」:不解析附件(内容非法也不读),直接提交。"""
+    row = snapshot()
+    row[fields.PROFILE_JSON] = attach()
+    bitable = FakeBitable("rec-1", row)
+    bitable.attachments["tok-1"] = b"{broken json"
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert bitable.download_tokens == []  # 附件从未被读取
+
+
+def test_claim_path_ignores_backfill_attempted_and_retries_attachment():
+    """反写轮已对同一 (record, token) 记过 attempted(坏文件)后,用户修正
+    附件内容并点「请求」:claim 路径仍重新解析 —— attempted 只约束无人
+    值守的反写轮,不阻塞显式提交(修复 stuck 行)。"""
+    bitable = FakeBitable(
+        "rec-1", json_draft_row(attachment=attach(), requested=False)
+    )
+    bitable.attachments["tok-1"] = b"{broken json"
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    # 第一轮:反写轮遇到坏附件 -> 记 attempted + 写错误信息(不置请求)
+    service.backfill_pending_json_rows()
+    assert bitable.records["rec-1"][fields.ERROR_MSG].startswith(
+        JSON_PARSE_ERROR_PREFIX
+    )
+    assert service._json_parse_attempted == {("rec-1", "tok-1")}
+
+    # 用户覆盖同一附件内容为合法 JSON(同 token)并点「请求」
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    bitable.records["rec-1"][fields.REQUESTED] = True
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.NAME] == "Test PLA"
+    assert row[fields.ERROR_MSG] == ""
+    assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
+    assert service._json_parse_attempted == {("rec-1", "tok-1")}  # 不再追加
+    assert bitable.download_tokens == ["tok-1", "tok-1"]

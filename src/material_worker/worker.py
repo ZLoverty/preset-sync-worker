@@ -36,8 +36,10 @@ class MaterialWorker:
                     f"{type(exc).__name__}: {exc}"
                 )
 
-        # V2-P2:JSON 附件导入 —— 草稿行挂 Profile JSON 附件时解析反写
-        # 标准字段(只填空、不自动提交;失败写「错误信息」,不热循环)。
+        # V2-P2/V2-P4:JSON 附件导入 —— 未进入提交生命周期(状态空/草稿)的
+        # 行挂 Profile JSON 附件时解析反写 + 置「已请求」,由下一轮轮询自动
+        # claim;已点「请求」的行由 process_record 在处理时先按附件反写再提交,
+        # 两个入口共用同一解析/只填空规则(见 submission_service)。
         self.submission_service.backfill_pending_json_rows()
 
         # 审查同步:推进「审核中」行(PR 合并 -> 已通过,关闭未合并 -> 已拒绝)。
