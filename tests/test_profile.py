@@ -1,447 +1,380 @@
-"""MaterialProfile 测试:V2-P4 canonical schema(构造 / 校验 / 序列化 / 附件解析)。"""
+"""MaterialProfile:身份派生、路径布局、必填/可选、输出形态、数值护栏。"""
 import json
 
 import pytest
 
-from helpers import make_profile, profile_attachment_json, row_fields
+from helpers import make_profile, row_fields
 
+from material_worker import fields
 from material_worker.domain.profile import (
-    ALLOWED_SLICERS,
+    FIELD_SCHEMA,
     REQUIRED_FIELDS,
     MaterialProfile,
     ProfileValidationError,
+    coerce_attachment_number,
+    describe_changes,
+    parse_profile_json,
 )
 
 
 # ----------------------------------------------------------------------
-# V2-P4:构造 + 派生视图
+# V3-P2:必填 / 可选
 # ----------------------------------------------------------------------
+def test_required_columns_match_v3_decision():
+    """必填 = 身份三要素 + 调参方法版本 + 继承预设 + 8 项核心参数。"""
+    assert [f.column for f in REQUIRED_FIELDS] == [
+        fields.PI_CODE,
+        fields.PRINTER_MODEL,
+        fields.SLICER,
+        fields.PM_METHOD_VERSION,
+        fields.INHERITS,
+        fields.BED_TEMP,
+        fields.NOZZLE_TEMP,
+        fields.FAN_COOLING_LAYER_TIME,
+        fields.FAN_MAX_SPEED,
+        fields.FAN_MIN_SPEED,
+        fields.SLOW_DOWN_LAYER_TIME,
+        fields.FLOW_RATIO,
+        fields.MAX_VOL_SPEED,
+    ]
 
-def test_create_profile_defaults():
-    profile = make_profile()
+
+def test_optional_columns_are_the_four():
+    optional = [f.column for f in FIELD_SCHEMA if not f.required]
+    assert optional == [
+        fields.FILAMENT_DENSITY,
+        fields.VITRIFICATION,
+        fields.RETRACTION_LENGTH,
+        fields.PRESSURE_ADVANCE,
+    ]
+
+
+def test_single_select_columns_are_not_backfillable():
+    """V3-P3:单选列必须人工在下拉中选择,附件一律不反写。"""
+    not_backfillable = {f.column for f in FIELD_SCHEMA if not f.backfill}
+    assert not_backfillable == {
+        fields.PI_CODE,
+        fields.PRINTER_MODEL,
+        fields.SLICER,
+        fields.PM_METHOD_VERSION,
+    }
+
+
+def test_missing_required_lists_all_columns():
+    data = row_fields()
+    for column in (fields.INHERITS, fields.NOZZLE_TEMP, fields.PI_CODE):
+        data.pop(column)
+    with pytest.raises(ProfileValidationError) as exc:
+        MaterialProfile.from_bitable_record("rec1", data)
+    message = str(exc.value)
+    for column in (fields.INHERITS, fields.NOZZLE_TEMP, fields.PI_CODE):
+        assert column in message
+
+
+def test_inherits_is_now_required():
+    """V3:继承预设为空 -> 报错、不生成 PR。"""
+    data = row_fields(**{fields.INHERITS: ""})
+    with pytest.raises(ProfileValidationError) as exc:
+        MaterialProfile.from_bitable_record("rec1", data)
+    assert fields.INHERITS in str(exc.value)
+
+
+def test_optional_blank_is_allowed():
+    profile = MaterialProfile.from_bitable_record("rec1", row_fields())
     profile.validate()
-
-    assert profile.name == "Test PLA"
-    assert profile.id is None  # 材料ID 可选,缺省不落
-
-
-def test_repo_name_is_derived_composite():
-    """name 键/文件名主干 = "<品名> @<品牌> <机型>";品名不单独成键(用户确认)。"""
-    assert make_profile().repo_name() == "Test PLA @BBL H2C"
+    assert profile.filament_density is None
+    assert profile.pressure_advance is None
 
 
-def test_repo_relative_path_follows_polymaker_layout():
-    """preset/<品名>/<品牌>/<机型>/<切片器>/<复合名>.json(§12 照搬实况)。"""
-    assert make_profile().repo_relative_path() == (
-        "preset/Test PLA/BBL/H2C/BambuStudio/Test PLA @BBL H2C.json"
+# ----------------------------------------------------------------------
+# V3-P4:身份与路径
+# ----------------------------------------------------------------------
+def test_identity_and_path():
+    profile = make_profile()
+    assert profile.identity == "L1002@BBL P2S"
+    assert profile.brand == "BBL"
+    assert profile.model == "P2S"
+    assert profile.repo_relative_path() == (
+        "preset/L1002/BBL/P2S/BambuStudio/L1002@BBL P2S.json"
     )
 
 
-def test_repo_relative_path_allows_spaces_and_chinese():
-    profile = make_profile(name="PolyTerra PLA", brand="Polymaker", model="Core One")
-    path = profile.repo_relative_path()
-    assert "preset/PolyTerra PLA/Polymaker/Core One/" in path
+def test_model_with_space_keeps_rest_intact():
+    """`Creality K2 Pro` -> 品牌 Creality / 机型 `K2 Pro`(只切第一个空格)。"""
+    profile = make_profile(printer_model="Creality K2 Pro")
+    assert profile.brand == "Creality"
+    assert profile.model == "K2 Pro"
+    assert profile.identity == "L1002@Creality K2 Pro"
+    assert profile.repo_relative_path() == (
+        "preset/L1002/Creality/K2 Pro/BambuStudio/L1002@Creality K2 Pro.json"
+    )
 
 
-def test_repo_relative_path_rejects_bad_segments():
-    """未校验对象直接构造时也防御:分隔符/保留字符做仓库目录段 -> 报错。"""
-    for key, bad in (("name", "a/b"), ("brand", "a\\b"), ("model", "a:b")):
-        with pytest.raises(ProfileValidationError):
-            make_profile(**{key: bad}).repo_relative_path()
+def test_slicer_is_part_of_identity_path():
+    """同一身份不同切片软件 -> 两个文件、互不覆盖。"""
+    bambu = make_profile()
+    prusa = make_profile(slicer="PrusaSlicer")
+    assert bambu.repo_relative_path() != prusa.repo_relative_path()
+    assert prusa.repo_relative_path() == (
+        "preset/L1002/BBL/P2S/PrusaSlicer/L1002@BBL P2S.json"
+    )
+    # 所有切片器统一 .json(V3:worker 只产基础数据)
+    assert prusa.repo_relative_path().endswith(".json")
 
 
-def test_resolved_id_prefers_material_id():
-    assert make_profile().resolved_id == "Test PLA"  # 缺省 = 品名
-    assert make_profile(id="mat-42").resolved_id == "mat-42"
+def test_printer_model_without_space_is_rejected():
+    profile = make_profile(printer_model="P2S")
+    with pytest.raises(ProfileValidationError) as exc:
+        profile.validate()
+    assert fields.PRINTER_MODEL in str(exc.value)
+
+
+def test_path_separator_in_segment_is_rejected():
+    profile = make_profile(pi_code="L/1002")
+    with pytest.raises(ProfileValidationError):
+        profile.validate()
 
 
 # ----------------------------------------------------------------------
-# V2-P4:to_dict / to_repo_dict / to_json —— Git 产物是派生视图
+# V3-P4:输出形态
 # ----------------------------------------------------------------------
-
-def test_to_dict_full_derived_view():
-    profile = make_profile(nozzle_temperature=220.0, pressure_advance=0.05)
+def test_to_dict_shape():
+    profile = make_profile(
+        filament_density=1.17,
+        temperature_vitrification=60,
+        filament_retraction_length=0.4,
+    )
     data = profile.to_dict()
 
-    assert data["id"] == "Test PLA"
-    assert data["name"] == "Test PLA @BBL H2C"
-    assert data["brand"] == "BBL"
-    assert data["model"] == "H2C"
+    assert data["name"] == "L1002@BBL P2S"
+    assert data["pi_code"] == "L1002"
+    assert data["printer"] == "BBL P2S"
     assert data["slicer"] == "BambuStudio"
-    assert data["filament_settings_id"] == "Test PLA @BBL H2C"  # = name(派生)
-    # 10 项必填 A 参数用 BambuStudio 官方 key(§8),标量数值
-    assert data["filament_density"] == 1.24
-    assert data["temperature_vitrification"] == 59
-    assert data["fan_cooling_layer_time"] == 100
-    assert data["fan_max_speed"] == 100
-    assert data["fan_min_speed"] == 100
-    assert data["slow_down_layer_time"] == 8
-    assert data["nozzle_temperature"] == 220  # 整数不写 220.0
-    assert data["filament_flow_ratio"] == 0.98
-    assert data["filament_max_volumetric_speed"] == 16
-    assert data["filament_retraction_length"] == 0.4
-    # 压力提前:值 + 派生开关(仅第三方机器,此处 brand 需非 BBL)
-    assert data["pressure_advance"] == 0.05
-    assert data["enable_pressure_advance"] == 1
+    assert data["inherits"] == "Panchroma PLA"
+    assert data["pm_method_version"] == "v1"
+    assert data["nozzle_temperature"] == 220
+    assert data["textured_plate_temp"] == 55
+
+    # V3:不写 id / filament_settings_id / 伴随键
+    assert "id" not in data
+    assert "filament_settings_id" not in data
+    assert not [k for k in data if k.endswith("_initial_layer")]
+    assert not [k for k in data if k.startswith("first_layer")]
+    # 全部为标量(数组化留给构建脚本)
+    assert all(not isinstance(v, list) for v in data.values())
 
 
-def test_to_dict_uses_material_id_when_given():
-    data = make_profile(id="mat-42").to_dict()
-    assert data["id"] == "mat-42"
-
-
-def test_to_dict_includes_truthy_optional_b_keys_only():
-    data = make_profile(
-        inherits="PolyTerra PLA @BBL H2C",
-        version="01.08.02.50",
-        pm_method_version="pm-v2.1",
-        pi_code="PT-PLA-001",
-    ).to_dict()
-    assert data["inherits"] == "PolyTerra PLA @BBL H2C"
-    assert data["version"] == "01.08.02.50"
-    assert data["pm_method_version"] == "pm-v2.1"
-    # V2-P4 seam:pi_code 仅建模存储,不进入 Git JSON(用户确认)
-    assert "pi_code" not in data
-
-
-def test_to_dict_omits_unset_optional_keys():
+def test_to_dict_omits_blank_optionals():
     data = make_profile().to_dict()
-    for key in ("inherits", "version", "pm_method_version",
-                "pressure_advance", "enable_pressure_advance"):
+    for key in (
+        "filament_density",
+        "temperature_vitrification",
+        "filament_retraction_length",
+        "pressure_advance",
+        "enable_pressure_advance",
+    ):
         assert key not in data
 
 
-def test_to_repo_dict_adds_worker_generated_metadata():
-    data = make_profile().to_repo_dict(submission_id="sub-abc")
-    assert data["submission"] == "sub-abc"  # 与 P1 submission_id 同语义(§15)
-    assert "generated_at" in data
-    assert "submission_id" not in data  # 旧键不再出现
-    assert "updated_at" not in data
+def test_integers_are_not_written_as_floats():
+    text = make_profile().to_json()
+    assert "220.0" not in text
+    assert '"nozzle_temperature": 220' in text
 
 
-def test_to_json_roundtrip():
-    text = make_profile().to_json(submission_id="sub-abc")
+def test_pressure_advance_ignored_on_bbl():
+    """V3:BBL 官方机型忽略压力提前 —— 不报错,也不输出该键。"""
+    profile = make_profile(pressure_advance=0.02)
+    profile.validate()  # 不报错
+    data = profile.to_dict()
+    assert "pressure_advance" not in data
+    assert "enable_pressure_advance" not in data
+
+
+def test_pressure_advance_written_on_third_party():
+    profile = make_profile(
+        printer_model="Prusa Core One", pressure_advance=0.02
+    )
+    profile.validate()
+    data = profile.to_dict()
+    assert data["pressure_advance"] == 0.02
+    assert data["enable_pressure_advance"] == 1
+
+
+def test_file_carries_no_provenance_keys():
+    """文件里只有材料数据 —— submission/generated_at 已按用户确认删除。"""
+    profile = make_profile()
+    data = profile.to_dict()
+    for key in ("submission", "submission_id", "generated_at", "submitted_at"):
+        assert key not in data
+    assert profile.to_json() == json.dumps(
+        data, ensure_ascii=False, indent=2
+    ) + "\n"
+
+
+def test_to_json_is_stable_and_ends_with_newline():
+    text = make_profile().to_json()
     assert text.endswith("\n")
     parsed = json.loads(text)
-    assert parsed["name"] == "Test PLA @BBL H2C"
-    assert parsed["submission"] == "sub-abc"
-
-
-def test_to_json_without_submission_id_omits_metadata():
-    parsed = json.loads(make_profile().to_json())
-    assert "submission" not in parsed
-    assert "generated_at" not in parsed
+    assert list(parsed)[:6] == [
+        "name",
+        "pi_code",
+        "printer",
+        "slicer",
+        "inherits",
+        "pm_method_version",
+    ]
 
 
 # ----------------------------------------------------------------------
-# V2-P4:validate(所有输入路径共用:必填 / 目录段 / 切片器白名单 / BBL-PA / 范围)
+# 差异描述(PR 正文的主体):把两版基础数据讲成人话
 # ----------------------------------------------------------------------
-
-def test_invalid_temperature_below_range():
-    with pytest.raises(ProfileValidationError):
-        make_profile(nozzle_temperature=-10).validate()
-
-
-def test_temperature_upper_bound():
-    with pytest.raises(ProfileValidationError):
-        make_profile(nozzle_temperature=700).validate()
+def test_describe_changes_first_submission_lists_values():
+    lines = describe_changes(None, make_profile().to_dict())
+    assert f"{fields.INHERITS}: Panchroma PLA" in lines
+    assert f"{fields.NOZZLE_TEMP}: 220 °C" in lines
+    assert f"{fields.MAX_VOL_SPEED}: 18 mm³/s" in lines
+    # 首次提交没有旧值可言 -> 不出现箭头
+    assert not [line for line in lines if "→" in line]
 
 
-def test_validate_missing_required():
-    """对象直构造缺必填 -> 逐字段报错。"""
-    profile = make_profile(name="")
+def test_describe_changes_order_and_labels_follow_the_table():
+    before = make_profile().to_dict()
+    after = make_profile(
+        inherits="Panchroma PLA HF", filament_flow_ratio=0.92
+    ).to_dict()
+    assert describe_changes(before, after) == [
+        f"{fields.INHERITS}: Panchroma PLA → Panchroma PLA HF",
+        f"{fields.FLOW_RATIO}: 0.95 → 0.92",
+    ]
+
+
+def test_describe_changes_renders_blank_as_unset():
+    """可选键从无到有 -> (未设置) → 值;派生键 enable_pressure_advance 不列。"""
+    before = make_profile().to_dict()  # BBL 忽略压力提前 -> 无该键
+    after = make_profile(
+        printer_model="Prusa Core One", pressure_advance=0.02
+    ).to_dict()
+    assert describe_changes(before, after) == [
+        f"{fields.PRESSURE_ADVANCE}: (未设置) → 0.02"
+    ]
+
+
+def test_describe_changes_marks_dropped_key_as_unset():
+    before = make_profile(filament_density=1.17).to_dict()
+    assert describe_changes(before, make_profile().to_dict()) == [
+        f"{fields.FILAMENT_DENSITY}: 1.17 g/cm³ → (未设置)"
+    ]
+
+
+def test_describe_changes_skips_identity_and_unchanged_keys():
+    """身份四要素在每个路径下恒定(正文首行已交代),不重复列出。"""
+    profile = make_profile(pressure_advance=0.02)  # BBL:该键被忽略
+    assert describe_changes(profile.to_dict(), profile.to_dict()) == []
+
+
+def test_describe_changes_never_leaks_legacy_provenance_keys():
+    """仓库里遗留的旧文件带 submission/generated_at —— 它们的消失也不该
+    借差异描述把内部 uuid 漏回 PR 正文。"""
+    legacy = make_profile().to_dict()
+    legacy["submission"] = "032d5ac951eb4501b631cd920c2fe6c5"
+    legacy["generated_at"] = "2026-09-11T10:23:00+08:00"
+    assert describe_changes(legacy, make_profile().to_dict()) == []
+
+
+def test_describe_changes_survives_hand_edited_value():
+    """仓库文件被手改成非数字时,正文照常生成(只影响这一行的写法)。"""
+    before = make_profile().to_dict()
+    before["nozzle_temperature"] = "很高"
+    assert describe_changes(before, make_profile().to_dict()) == [
+        f"{fields.NOZZLE_TEMP}: 很高 → 220 °C"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (None, None),
+        ("", None),
+        ("不是 JSON", None),
+        ("[1, 2]", None),          # 合法 JSON 但不是对象
+        ('{"a": 1}', {"a": 1}),
+    ],
+)
+def test_parse_profile_json_tolerates_garbage(text, expected):
+    assert parse_profile_json(text) == expected
+
+
+# ----------------------------------------------------------------------
+# 数值护栏
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "key,value,column",
+    [
+        ("nozzle_temperature", 900, fields.NOZZLE_TEMP),
+        ("fan_max_speed", 120, fields.FAN_MAX_SPEED),
+        ("filament_flow_ratio", 0, fields.FLOW_RATIO),
+        ("textured_plate_temp", -5, fields.BED_TEMP),
+    ],
+)
+def test_numeric_bounds(key, value, column):
+    profile = make_profile(**{key: value})
     with pytest.raises(ProfileValidationError) as exc:
         profile.validate()
-    assert "品名" in str(exc.value)
+    assert column in str(exc.value)
 
 
-def test_validate_rejects_path_chars_in_name():
-    with pytest.raises(ProfileValidationError) as exc:
-        make_profile(name="PLA/../../evil").validate()
-    assert "品名" in str(exc.value)
+def test_bounds_skip_blank_optionals():
+    make_profile(filament_density=None, pressure_advance=None).validate()
 
 
-@pytest.mark.parametrize("slicer", [
-    s for s in ("PrusaSlicer", "Cura", "", "BambuStudio ") if s != "BambuStudio"
-])
-def test_validate_rejects_unsupported_slicer(slicer):
-    with pytest.raises(ProfileValidationError) as exc:
-        make_profile(slicer=slicer).validate()
-    message = str(exc.value)
-    assert "切片器" in message
-    if slicer == "PrusaSlicer":
-        assert ".ini" in message  # 明确提示暂不支持 PrusaSlicer
-
-
-def test_validate_accepts_all_allowed_slicers():
-    for slicer in ALLOWED_SLICERS:
-        make_profile(slicer=slicer).validate()
-
-
-def test_validate_bbl_pressure_advance_rejected():
-    with pytest.raises(ProfileValidationError) as exc:
-        make_profile(brand="BBL", pressure_advance=0.05).validate()
-    assert "官方机型" in str(exc.value)
-
-
-def test_validate_third_party_pressure_advance_accepted():
-    make_profile(brand="Elegoo", pressure_advance=0.05).validate()
-
-
-def test_validate_numeric_bounds():
-    """安全护栏:明显单位/小数位笔误逐字段报错(宽松,不误伤真实值)。"""
-    cases = (
-        dict(filament_density=0),
-        dict(filament_density=99),
-        dict(temperature_vitrification=900),
-        dict(fan_cooling_layer_time=-1),
-        dict(fan_max_speed=101),
-        dict(fan_min_speed=-5),
-        dict(slow_down_layer_time=9999),
-        dict(filament_flow_ratio=0),
-        dict(filament_flow_ratio=9),
-        dict(filament_max_volumetric_speed=-2),
-        dict(filament_max_volumetric_speed=500),
-        dict(filament_retraction_length=-1),
-        dict(filament_retraction_length=999),
-        dict(pressure_advance=-1),
-        dict(pressure_advance=7),
-    )
-    for overrides in cases:
-        with pytest.raises(ProfileValidationError):
-            make_profile(brand="Elegoo", **overrides).validate()
-
-
-def test_validate_full_valid_profile_passes():
-    make_profile().validate()
-
-
-# ----------------------------------------------------------------------
-# V2-P4:from_bitable_record(中文列名,B 列/数字字符串均可用)
-# ----------------------------------------------------------------------
-
-def test_from_bitable_record_full_row():
-    profile = MaterialProfile.from_bitable_record(
-        record_id="rec123",
-        record_fields=row_fields(),
-    )
-    assert profile.name == "Test PLA"
-    assert profile.brand == "BBL"
-    assert profile.model == "H2C"
-    assert profile.slicer == "BambuStudio"
-    assert profile.nozzle_temperature == 220
-    assert profile.source_record_id == "rec123"
-    assert profile.submitted_at is not None
-
-
-def test_from_bitable_record_accepts_numeric_strings():
-    fields = row_fields(喷嘴温度="220", 流量比例="0.98")
-    profile = MaterialProfile.from_bitable_record("rec123", fields)
+def test_bitable_numeric_strings_are_coerced():
+    data = row_fields(**{fields.NOZZLE_TEMP: "220", fields.FLOW_RATIO: "0.95"})
+    profile = MaterialProfile.from_bitable_record("rec1", data)
     assert profile.nozzle_temperature == 220.0
-    assert profile.filament_flow_ratio == 0.98
+    assert profile.filament_flow_ratio == 0.95
 
 
-def test_from_bitable_record_missing_field_reports_all_missing():
-    """缺必填 -> 一次性列出全部缺失列(逐字段报错),不逐个试错。"""
-    fields = row_fields()
-    fields.pop("品牌")
-    fields.pop("线材密度")
-    fields.pop("最大体积流速")
+def test_bitable_malformed_number_raises():
+    data = row_fields(**{fields.NOZZLE_TEMP: "很高"})
     with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.from_bitable_record("rec123", fields)
-    message = str(exc.value)
-    assert message.startswith("缺少必填字段: ")
-    assert "品牌" in message and "线材密度" in message and "最大体积流速" in message
-    assert "Profile JSON" in message  # 附导入指引
-
-
-def test_from_bitable_record_invalid_number():
-    fields = row_fields(喷嘴温度="hot")
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.from_bitable_record("rec123", fields)
-    assert "喷嘴温度" in str(exc.value)
-
-
-def test_from_bitable_record_uses_material_id_and_optional_columns():
-    fields = row_fields(
-        材料ID="mat-42",
-        继承预设="PolyTerra PLA @BBL H2C",
-        **{"PI Code": "PT-PLA-001"},
-    )
-    profile = MaterialProfile.from_bitable_record("rec123", fields)
-    assert profile.id == "mat-42"
-    assert profile.inherits == "PolyTerra PLA @BBL H2C"
-    assert profile.pi_code == "PT-PLA-001"
-
-
-def test_from_bitable_record_blank_optionals_stay_none():
-    profile = MaterialProfile.from_bitable_record("rec123", row_fields())
-    assert profile.pressure_advance is None
-    assert profile.pi_code is None
-    assert profile.id is None
+        MaterialProfile.from_bitable_record("rec1", data)
+    assert fields.NOZZLE_TEMP in str(exc.value)
 
 
 # ----------------------------------------------------------------------
-# V2-P4:parse_attachment_json(英文 key,与表格同一 schema,严格不许猜)
+# V3-P3:附件数值取值 —— 数组先剔 nil 槽位,再要求剩余值一致
 # ----------------------------------------------------------------------
-
-def test_parse_attachment_json_full():
-    profile = MaterialProfile.parse_attachment_json(profile_attachment_json())
-    assert profile.name == "Test PLA"
-    assert profile.brand == "BBL"
-    assert profile.nozzle_temperature == 220
-    assert profile.filament_flow_ratio == 0.98
-    assert profile.pressure_advance is None
-
-
-def test_parse_attachment_json_optional_values():
-    profile = MaterialProfile.parse_attachment_json(
-        profile_attachment_json(
-            pressure_advance=0.05, pi_code="PT-PLA-001",
-            inherits="PolyTerra PLA @BBL H2C",
-        )
-    )
-    assert profile.pressure_advance == 0.05
-    assert profile.pi_code == "PT-PLA-001"
-    assert profile.inherits == "PolyTerra PLA @BBL H2C"
-
-
-def test_parse_attachment_json_id_defaults_to_name():
-    """附件没带 id 时与表格语义一致:缺省用品名(材料ID 不另落列)。"""
-    profile = MaterialProfile.parse_attachment_json(profile_attachment_json())
-    assert profile.id is None
-    assert profile.resolved_id == "Test PLA"
-
-
-def test_parse_attachment_json_accepts_numeric_strings():
-    text = profile_attachment_json(nozzle_temperature="220")
-    profile = MaterialProfile.parse_attachment_json(text)
-    assert profile.nozzle_temperature == 220
-
-
-def test_parse_attachment_json_accepts_bambustudio_array_shapes():
-    """V2-P4:数值兼容 BambuStudio 系数组 —— 单元素或各值一致都取该值。"""
-    text = profile_attachment_json(
-        nozzle_temperature=["220"],
-        filament_retraction_length=["0.4", "0.4"],
-        filament_max_volumetric_speed=[16, 16],  # 数字数组也可
-    )
-    profile = MaterialProfile.parse_attachment_json(text)
-    assert profile.nozzle_temperature == 220
-    assert profile.filament_retraction_length == 0.4
-    assert profile.filament_max_volumetric_speed == 16
-
-
-def test_parse_attachment_json_rejects_inconsistent_array():
-    """多喷头值不一致(如 ['220','230'])-> 报错提示改单值,不静默挑选。"""
-    text = profile_attachment_json(nozzle_temperature=["220", "230"])
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json(text)
-    message = str(exc.value)
-    assert "各值不一致" in message
-    assert "nozzle_temperature(喷嘴温度)" in message
-
-
-def test_parse_attachment_json_rejects_nil_and_empty_array():
-    """含 nil/null/空 或空数组 -> 报错(真实文件里 'nil' 表示该喷头未设置)。"""
-    text = profile_attachment_json(filament_flow_ratio=["1.01", "nil"])
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json(text)
-    assert "nil" in str(exc.value) and "未设置值" in str(exc.value)
-
-    text = profile_attachment_json(filament_flow_ratio=[])
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json(text)
-    assert "空数组" in str(exc.value)
-
-
-def test_parse_attachment_json_trims_text_whitespace():
-    text = profile_attachment_json(name="  Test PLA  ")
-    profile = MaterialProfile.parse_attachment_json(text)
-    assert profile.name == "Test PLA"
-
-
-def test_parse_attachment_json_ignores_unknown_keys():
-    """V2-P4(用户确认):真实 BambuStudio 系文件的附加键一律忽略,
-    只要 14 个必填键能解析出来就认为合法。"""
-    text = profile_attachment_json(
-        cool_plate_temp=["35"],
-        filament_type="PLA",
-        **{"from": "User"},  # from 是保留字,只能经 ** 传
-        instantiation="true",
-        type="filament",
-    )
-    profile = MaterialProfile.parse_attachment_json(text)
-    assert profile.name == "Test PLA"
-    assert profile.nozzle_temperature == 220
-
-
-def test_parse_attachment_json_ignores_reserved_worker_keys():
-    """V2-P4(用户确认):worker 生成/派生键(submission/generated_at/
-    filament_settings_id/enable_pressure_advance)由 worker 自己生成,
-    附件携带同名键不读取、不报错(如真实文件里的 filament_settings_id)。"""
-    text = profile_attachment_json(
-        submission="fake",
-        generated_at="fake",
-        filament_settings_id=["someone else @BBL H2C"],
-        enable_pressure_advance=1,
-    )
-    profile = MaterialProfile.parse_attachment_json(text)
-    assert profile.resolved_id == "Test PLA"  # 附件内容未被伪造键影响
-
-
-def test_parse_attachment_json_reports_all_missing_fields():
-    text = '{"name": "Test PLA", "brand": "BBL"}'
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json(text)
-    message = str(exc.value)
-    assert "缺少必填字段" in message
-    assert "nozzle_temperature(喷嘴温度)" in message  # key(中文列) 形态
-    assert "slicer(切片器)" in message
-
-
-def test_parse_attachment_json_rejects_empty_and_non_object():
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json("")
-    assert "为空" in str(exc.value)
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json("[]")
-    assert "顶层必须是对象" in str(exc.value)
-
-
-def test_parse_attachment_json_rejects_malformed_json():
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json("{not json")
-    assert "不是合法 JSON" in str(exc.value)
-
-
-def test_parse_attachment_json_rejects_bad_number():
-    text = profile_attachment_json(nozzle_temperature="hot")
-    with pytest.raises(ProfileValidationError) as exc:
-        MaterialProfile.parse_attachment_json(text)
-    message = str(exc.value)
-    assert "nozzle_temperature(喷嘴温度)" in message
-    assert "不是有效数字" in message
-
-
-def test_parse_attachment_json_numeric_blank_treated_as_unset():
-    """可选数字键显式给空 -> None(validate 放行,不落 JSON)。"""
-    text = profile_attachment_json(pressure_advance=None)
-    profile = MaterialProfile.parse_attachment_json(text)
-    assert profile.pressure_advance is None
-
-
-# ----------------------------------------------------------------------
-# 结构一致性:REQUIRED_FIELDS 必须 = 14 项(4 结构 + 10 耗材参数)
-# ----------------------------------------------------------------------
-
-def test_required_fields_are_14():
-    assert len(REQUIRED_FIELDS) == 14
-    keys = [f.key for f in REQUIRED_FIELDS]
-    for key in ("name", "brand", "model", "slicer",
-                "filament_density", "temperature_vitrification",
-                "fan_cooling_layer_time", "fan_max_speed", "fan_min_speed",
-                "slow_down_layer_time", "nozzle_temperature",
-                "filament_flow_ratio", "filament_max_volumetric_speed",
-                "filament_retraction_length"):
-        assert key in keys
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # 实测 nozzle_temperature 常是 ["300", "nil"]:未启用的喷头槽位写 nil,
+        # 剔除后剩单个值 -> 可唯一确定
+        (["300", "nil"], 300),
+        (["nil", "300"], 300),
+        (["300", None], 300),      # JSON 真 null
+        (["300", ""], 300),        # 空字符串槽位
+        ([300, "nil"], 300),       # 数字与字符串混排
+        (["300", "nil", "300"], 300),
+        # 无 nil 的既有形态
+        (["220"], 220),
+        (["220", "220"], 220),
+        ([0, "0"], 0),
+        # 标量形态
+        ("220", 220),
+        (220, 220),
+        (0.95, 0.95),
+        # —— 无法唯一确定 -> None(调用方跳过该键,绝不静默挑一个喷头)——
+        (["220", "240"], None),          # 多喷头真的调得不同
+        (["220", "nil", "240"], None),   # 剔除 nil 后仍不一致
+        (["nil", "nil"], None),          # 全是空槽位
+        (["nil"], None),
+        ([], None),
+        ("nil", None),
+        (None, None),
+        ("很高", None),
+        (["220", "很高"], None),
+    ],
+)
+def test_coerce_attachment_number_slots(raw, expected):
+    assert coerce_attachment_number(fields.NOZZLE_TEMP, raw) == expected

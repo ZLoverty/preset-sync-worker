@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping, Sequence
 
-from material_worker.domain.profile import MaterialProfile
+from material_worker.domain.profile import (
+    MaterialProfile,
+    describe_changes,
+    parse_profile_json,
+)
 from material_worker.exceptions import (
     GitRepositoryError,
     PermanentError,
@@ -20,6 +25,11 @@ REQUEST_TIMEOUT_SECONDS = 30
 
 # GitHub 对 PR list 的 head 过滤需要 owner:branch;Gitea 用 branch 名即可。
 # 非 github.com 的 host 一律按 Gitea 兼容 API(/api/v1)处理。
+
+#: PR 编号在 URL 里的形态:GitHub `/pull/123`、Gitea `/pulls/123`。
+#: V3-P5:表里没有提交 ID 列,`PR URL` 就是本轮 PR 的唯一锚点,
+#: 审查同步/重复点击都按它反查 PR 实况。
+_PR_NUMBER_RE = re.compile(r"/(?:pull|pulls)/(\d+)(?:[/?#]|$)")
 
 
 @dataclass
@@ -98,16 +108,26 @@ class GitRepository:
         return parsed.scheme, host, segments[0], segments[1]
 
     @staticmethod
-    def branch_name_for(submission_id: str) -> str:
-        """branch 名由 submission_id 唯一确定(P4 #20,幂等的基础)。"""
-        return f"material/{submission_id}"
+    def _slug(text: str) -> str:
+        """branch 名片段:空白折叠为下划线(branch 名不能含空格)。"""
+        return re.sub(r"\s+", "_", text.strip())
+
+    @classmethod
+    def branch_name_for(cls, identity: str, slicer: str) -> str:
+        """branch 名由**行身份**唯一确定(V3-P5,幂等的基础)。
+
+        一行 = 一个身份(PI Code × 打印机型号 × 切片软件),每次提交都
+        提交这一行 -> 同一 branch;重复点击/自动重试天然收敛到同一个
+        branch 与同一个 PR,绝不产生第二个。
+        """
+        return f"material/{cls._slug(f'{identity}_{slicer}')}"
 
     def profile_path(self, profile: MaterialProfile) -> str:
         """档案文件在仓库中的路径(纯函数,不触网)。
 
-        V2-P4:布局 = 照搬 Polymaker-Preset 实况(域内派生,见
-        MaterialProfile.repo_relative_path):目录段为 品名/品牌/机型/切片器,
-        均保留空格/中文原样(validate 已拒分隔符与保留字符)。
+        V3-P4:布局 = preset/<PI Code>/<品牌>/<机型>/<切片软件>/<身份>.json
+        (域内派生,见 MaterialProfile.repo_relative_path);品牌/机型由
+        打印机型号按第一个空格切分,空格与中文原样保留。
         """
         return profile.repo_relative_path()
 
@@ -202,68 +222,66 @@ class GitRepository:
     # ------------------------------------------------------------------
     # P4/P5 公开操作(幂等组合见 submit_profile)
     # ------------------------------------------------------------------
-    def find_submission(
-        self,
-        submission_id: str,
-    ) -> PullRequestResult | None:
-        """按确定性 branch 查找该提交已建好的 PR。
+    @staticmethod
+    def pull_number(pr_url: str) -> int | None:
+        """从 PR URL 解析编号(GitHub `/pull/123`、Gitea `/pulls/123`)。"""
+        match = _PR_NUMBER_RE.search(pr_url or "")
+        return int(match.group(1)) if match else None
 
-        覆盖场景:Git 成功但 Bitable 回写失败后的重试 ——
-        此时 PR 已存在,直接返回,绝不新建第二个(P4 #21/#22)。
+    def _pull_by_url(self, pr_url: str) -> dict[str, Any] | None:
+        """按 `PR URL` 列取该 PR 的原始记录(无法解析编号/不存在 -> None)。"""
+        number = self.pull_number(pr_url)
+        if number is None:
+            return None
+        return self._request(
+            "GET",
+            f"/repos/{self._owner}/{self._repo}/pulls/{number}",
+            allow_404=True,
+        )
+
+    def find_open_pr_for_branch(self, branch: str) -> PullRequestResult | None:
+        """该 branch 上**处于打开状态**的 PR(无则 None)。
+
+        V3-P5:同一 branch 上会累积多轮历史 PR(已合并/已关闭),因此
+        这里只认 open 的 —— 它是「提交已落库但 Bitable 回写失败」这一
+        重试场景的收敛点。已合并/已关闭的 PR 属于上一轮,再次提交
+        应当开启新一轮(行内 `PR URL` 在 claim 时已清空)。
         """
-        branch = self.branch_name_for(submission_id)
-        pulls = self._list_pulls()
-        for pull in pulls:
-            # 只认 open 或已合并的 PR;已关闭未合并视为旧提交流程被手动终止,
-            # 不应被静默复用(继续走新建分支逻辑会得到明确的冲突报错)。
-            state = pull.get("state")
-            if not (state == "open" or pull.get("merged") is True):
+        for pull in self._list_pulls():
+            if pull.get("state") != "open":
                 continue
             head_ref = ((pull.get("head") or {}).get("ref")) or ""
-            if head_ref == branch:
-                url = pull.get("html_url") or pull.get("url")
-                if not url:
-                    continue
-                return PullRequestResult(branch_name=branch, pull_request_url=url)
+            if head_ref != branch:
+                continue
+            url = pull.get("html_url") or pull.get("url")
+            if url:
+                return PullRequestResult(
+                    branch_name=branch, pull_request_url=str(url)
+                )
         return None
 
-    def submission_pr_state(self, submission_id: str) -> str | None:
-        """该提交的 PR 当前状态(供审查同步): "merged"/"open"/"closed"/None。
+    def pr_state(self, pr_url: str) -> str | None:
+        """`PR URL` 指向的 PR 当前状态(供审查同步): "merged"/"open"/"closed"/None。
 
         已合并的 PR state 通常为 closed 且 merged=true,需先判 merged;
-        None 表示该 branch 上没有任何 PR。
+        None 表示 URL 为空、解析不出编号或该 PR 已不存在。
         """
-        pull = self._find_pull_for_branch(submission_id)
+        pull = self._pull_by_url(pr_url)
         if pull is None:
             return None
         if pull.get("merged") is True:
             return "merged"
-        state = pull.get("state")
-        return "open" if state == "open" else "closed"
+        return "open" if pull.get("state") == "open" else "closed"
 
-    def _find_pull_for_branch(
-        self, submission_id: str
-    ) -> dict[str, Any] | None:
-        """该提交 branch 上第一个 PR 的原始记录(无则 None)。
-
-        V2-P3:关闭理由读取与状态判定共用同一次 PR 列表扫描。
-        """
-        branch = self.branch_name_for(submission_id)
-        for pull in self._list_pulls():
-            head_ref = ((pull.get("head") or {}).get("ref")) or ""
-            if head_ref == branch:
-                return pull
-        return None
-
-    def pr_close_reason(self, submission_id: str) -> str | None:
-        """V2-P3:该提交被关闭(未合并)PR 的关闭理由 = 关闭前最后一条评论正文。
+    def pr_close_reason(self, pr_url: str) -> str | None:
+        """V2-P3:该被关闭(未合并)PR 的关闭理由 = 关闭前最后一条评论正文。
 
         候选评论 = 普通评论(issues/{number}/comments,GitHub/Gitea 同构,
         系统事件不含在内)中 created_at 不晚于 PR closed_at 的正文非空评论;
         取时间最晚的一条。无候选评论返回 None;读取失败抛异常,
         由调用方记录日志(状态推进不受影响)。
         """
-        pull = self._find_pull_for_branch(submission_id)
+        pull = self._pull_by_url(pr_url)
         if pull is None or pull.get("merged") is True:
             return None
         if pull.get("state") != "closed":
@@ -502,59 +520,126 @@ class GitRepository:
     # ------------------------------------------------------------------
     # 高层幂等编排(P4 #18-#22)
     # ------------------------------------------------------------------
+    @staticmethod
+    def commit_message(
+        profile: MaterialProfile,
+        submitter: str,
+        submit_time: str,
+        process_records: Sequence[str] = (),
+    ) -> str:
+        """commit message:材料身份 + 提交人/时间 + 过程记录文件名(V3-P7/P8)。
+
+        过程记录**附件本体不进 Git**,只留文件名 —— 每条改动与当时的
+        调参记录一一对应(用户确认的语义:提交成功后表里的过程记录被清空,
+        Git 历史是它唯一的留存处)。
+        """
+        lines = [
+            f"[材料] {profile.identity} ({profile.slicer})",
+            "",
+            f"提交人: {submitter} · 提交时间: {submit_time}",
+        ]
+        if process_records:
+            lines.append("")
+            lines.append("过程记录:")
+            lines.extend(f"- {name}" for name in process_records)
+        return "\n".join(lines)
+
+    @staticmethod
+    def pull_request_body(
+        profile: MaterialProfile,
+        before: Mapping[str, Any] | None,
+        submitter: str,
+        submit_time: str,
+    ) -> str:
+        """PR 正文:第一行身份,中间是「人话版」字段差异,最后提交人/时间。
+
+        `before` = 默认分支上该档案的现状(None = 首次提交)。正文只讲
+        改了什么 —— 审查者据此就能判断这次调整合不合理,不必自己点开
+        diff 逐键比对;字段标签用表格列名、数值带单位,不出现内部键名。
+        """
+        lines = [f"{profile.identity} · {profile.slicer}", ""]
+        changes = describe_changes(before, profile.to_dict())
+        lines.extend(changes or ["(与默认分支相比,基础数据无字段级变化)"])
+        lines.extend(["", f"提交人: {submitter} · 提交时间: {submit_time}"])
+        return "\n".join(lines) + "\n"
+
     def submit_profile(
         self,
-        submission_id: str,
         profile: MaterialProfile,
+        pull_request_url: str = "",
+        submitter: str = "(未记录)",
+        submit_time: str = "(未记录)",
+        process_records: Sequence[str] = (),
     ) -> PullRequestResult:
-        """幂等地把一个提交的材料档案落库并开 PR。
+        """幂等地把一个行身份的基础数据落库并开 PR(V3-P5)。
 
-        步骤:已有 PR -> 返回;无则 建 branch -> 写/更新档案文件
-        (内容相同则跳过)-> 建 PR。任一步失败后整体重试都只会收敛
-        到同一个 branch/同一个 PR,绝不会产生重复 PR。
+        步骤:本轮已有 PR(按 `PR URL`,或 branch 上处于打开状态的 PR)
+        -> 直接返回;否则 建 branch -> 写/更新档案文件(内容相同则跳过)
+        -> 校验确有变更 -> 建 PR。任一步失败后整体重试都只会收敛到同一个
+        branch/同一个 PR,绝不会产生重复 PR。
+
+        档案文件只含材料数据本身(无溯源键);PR 正文 = 与默认分支的
+        字段级差异(`pull_request_body`),提交人/时间同时写进 commit
+        message。
         """
-        existing = self.find_submission(submission_id)
-        if existing is not None:
-            return existing
+        branch = self.branch_name_for(profile.identity, profile.slicer)
 
-        branch = self.branch_name_for(submission_id)
+        # 本轮 PR 优先认行内 `PR URL`(同一 branch 上可能累积多轮历史 PR)
+        if pull_request_url:
+            state = self.pr_state(pull_request_url)
+            if state == "open":
+                return PullRequestResult(
+                    branch_name=branch, pull_request_url=pull_request_url
+                )
+        else:
+            existing = self.find_open_pr_for_branch(branch)
+            if existing is not None:
+                return existing
+
         self.create_branch(branch)
 
         path = self.profile_path(profile)
-        content = profile.to_json(submission_id=submission_id)
-        message = (
-            f"[material] {profile.repo_name()} "
-            f"(submission {submission_id[:8]})"
+        content = profile.to_json()
+        message = self.commit_message(
+            profile, submitter, submit_time, process_records
         )
         self.commit(branch, message, path, content)
         self.push(branch)
 
-        # 内容与默认分支一致(如已合并过且无改动再次提交)-> 没有可提交的变更
-        base_sha = self._branch_sha(self._repo_default_branch())
-        head_sha = self._branch_sha(branch)
-        if base_sha == head_sha:
+        # 空变更保护:文件内容与默认分支完全一致(如已合并过且无改动
+        # 再次提交)-> 没有可提交的差异,不建空 PR。
+        # 按**内容**而非 commit sha 判定:branch 可能停在旧基线上,
+        # sha 比较会漏判这种情况。
+        base_file = self._get_file(self._repo_default_branch(), path)
+        head_file = self._get_file(branch, path)
+        if base_file is None and head_file is None:
+            raise GitRepositoryError(f"提交后远端仍读不到档案文件: {path}")
+        if (
+            base_file is not None
+            and head_file is not None
+            and base_file["content"] == head_file["content"]
+        ):
             raise PermanentError(
-                "材料内容与仓库默认分支一致,没有新的变更,未创建 PR"
+                f"「{profile.identity}」的基础数据与仓库默认分支一致,"
+                f"没有新的变更,未创建 PR"
             )
 
-        title = f"[材料提交] {profile.repo_name()}"
-        body = (
-            f"材料: {profile.repo_name()}\n"
-            f"品名: {profile.name}\n"
-            f"机型: {profile.brand} {profile.model} ({profile.slicer})\n"
-            f"喷嘴温度: {profile.nozzle_temperature} °C\n"
-            f"最大体积流速: {profile.filament_max_volumetric_speed} mm³/s\n\n"
-            f"Submission: {submission_id}\n"
+        title = f"[材料提交] {profile.identity} ({profile.slicer})"
+        body = self.pull_request_body(
+            profile,
+            parse_profile_json(base_file["content"]) if base_file else None,
+            submitter,
+            submit_time,
         )
         try:
             return self.create_pull_request(branch, title, body)
         except _PullRequestExists:
             # 并发/上次建 PR 成功后未回写 —— 找到既有 PR 返回
-            found = self.find_submission(submission_id)
+            found = self.find_open_pr_for_branch(branch)
             if found is None:
                 raise PermanentError(
-                    f"该提交(branch={branch})已存在一个未合并且已关闭的 PR:"
-                    f"请关闭该旧分支后重试,或在表格中把状态置为 已拒绝/已通过"
+                    f"该行(branch={branch})上已存在一个未合并且已关闭的 PR:"
+                    f"请在 Git 侧处理该旧 PR,或把表格状态置为 已拒绝/已通过 "
                     f"后作为新一轮提交重新发起"
                 ) from None
             return found

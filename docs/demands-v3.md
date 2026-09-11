@@ -193,22 +193,35 @@ Pages(构建产物,不进 repo)
      "temperature_vitrification": 60,
      "filament_retraction_length": 0.4,
      "pressure_advance": 0.02,
-     "enable_pressure_advance": 1,
-     "submission": "032d5ac951eb4501b631cd920c2fe6c5",
-     "generated_at": "2026-09-11T10:23:00+08:00"
+     "enable_pressure_advance": 1
    }
    ```
    - 数值为**标量**,整数不写 `.0`;**不写** `_initial_layer`/`first_layer_*` 类伴随键(构建阶段补);
    - 不输出 `id` / `filament_settings_id`;
    - `pi_code`/`printer`/`slicer` 独立成键 —— 供构建阶段拼 product name 版 preset;
    - 可选键按是否填写出现;`inherits` 必填故恒在;
-   - `submission`(每轮 uuid)/`generated_at` 由 worker 生成,只进文件与 PR,**不写表**(表里已无该列)。
+   - **文件里没有任何 worker 溯源键**:`submission`(每轮 uuid)/`generated_at` 已按用户确认删除(无用)—— 文件里每一行都是材料数据,谁在什么时候改了什么由 PR 正文与 commit message 交代;
+4. **PR 正文讲 diff**(用户确认的形态:第一行简洁的身份,中间是 diff,最后是提交人和时间):
+   ```
+   L1002@BBL P2S · BambuStudio
+
+   喷嘴温度: 220 °C → 215 °C
+   流量比例: 0.95 → 0.92
+   回抽距离: (未设置) → 0.4 mm
+
+   提交人: 张三 · 提交时间: 2026-09-11 10:23
+   ```
+   - 差异 = 默认分支上该档案的现状 vs 本次内容,逐键比对(两者本来就要读,不额外发请求);
+   - 标签用**表格列名**、数值带单位,不出现内部键名(`fan_max_speed` 之类审查者不认);
+   - 首次提交无旧值可比 → 列全部取值、不带箭头;原先没有/现在没有的键写 `(未设置)`;
+   - 身份四要素不重复列出(路径下恒定,首行已交代);派生键 `enable_pressure_advance` 不列;没动的字段不出现。
 
 ### 验收标准
 
 1. 一行提交 → 文件落在上述路径,键值与表格一致;
 2. 同一身份不同切片软件 → 两个文件、互不覆盖;
-3. 可选列为空 → 对应键不出现;输出中无数组、无 `_initial_layer` 键。
+3. 可选列为空 → 对应键不出现;输出中无数组、无 `_initial_layer` 键;
+4. PR 正文改动一个字段 → 正文只出现该字段的 `旧 → 新` 一行。
 
 **状态:待实施**
 
@@ -284,7 +297,7 @@ Pages(构建产物,不进 repo)
 
 1. 按钮 Automation 在点击时写入 `提交人`(人员)/`提交时间`(日期),再置 `已请求 = true`(**建议与 `已请求` 同一次更新写入**,避免 worker 抢读空值);
 2. worker 在 claim 时读取这两列:人员列取姓名,日期列(毫秒时间戳)格式化为本地时间;
-3. 写入 **PR 正文**(如 `提交人: 张三 · 提交时间: 2026-09-11 10:23`)与 commit message 文本;**不修改这两列**;
+3. 写入 **PR 正文末行**(如 `提交人: 张三 · 提交时间: 2026-09-11 10:23`)与 commit message 文本;**不修改这两列**;
 4. 两列为空(未走按钮触发)→ 正文写 `(未记录)`,不影响提交;
 5. Git 的 author 字段不做改动(GitHub 不支持自定义 author,保持两平台行为一致)。
 
@@ -354,8 +367,8 @@ Pages(构建产物,不进 repo)
 | [domain/profile.py](../src/material_worker/domain/profile.py) | `FIELD_SCHEMA` 重写、必填位重排(含 `继承预设`)、派生身份与路径、`to_dict` 重写、附件解析改宽容 |
 | domain/slicer_import.py(新) | Prusa `.ini` **导入映射表**(仅反写方向,V3-P6) |
 | [adapters/bitable.py](../src/material_worker/adapters/bitable.py) | `ensure_schema` 改为"部分自动创建 + 部分只校验";人员/日期列读取 |
-| [adapters/git.py](../src/material_worker/adapters/git.py) | branch 由身份派生;按 `PR URL` 查 PR;commit message 携带提交人/过程记录 |
+| [adapters/git.py](../src/material_worker/adapters/git.py) | branch 由身份派生;按 `PR URL` 查 PR;PR 正文讲 diff;commit message 携带提交人/过程记录 |
 | [services/submission_service.py](../src/material_worker/services/submission_service.py) | 附件反写去掉自动提交、重复身份检测、提交人/时间读取、过程记录清空 |
-| [domain/status.py](../src/material_worker/domain/status.py) / submission.py | 去掉 `submission_id` 解析逻辑,改为身份派生 |
+| [domain/status.py](../src/material_worker/domain/status.py) / submission.py | 去掉 `submission_id` 解析与生成逻辑,改为身份派生 |
 | [README.md](../README.md) | 建表指南、路径布局、必填可选、附件规则、仓库分工(Pages)同步更新 |
 | tests/ | 回归 + 新增用例(schema/身份/附件宽容/`.ini` 导入/重复身份) |

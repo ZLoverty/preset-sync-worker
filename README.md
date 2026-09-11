@@ -1,109 +1,145 @@
 # Material Profile Worker
 
-Feishu Bitable 按钮 → Automation → `已请求=true` → worker 轮询 → 材料档案 JSON 写入 Git 仓库并开 PR → 回写 `状态=审核中`。
+Feishu Bitable 按钮 → Automation 写入 `提交人`/`提交时间` 并置 `已请求=true` → worker 轮询 → **基础数据 JSON** 写入 `preset-db` 并开 PR → 回写 `状态=审核中`。
 
-Git 仓库是材料档案的唯一真相源(不引入数据库)。文档见 [docs/agent-instruction.md](docs/agent-instruction.md)。
+Git 仓库是材料档案的唯一真相源(不引入数据库)。需求见 [docs/demands-v3.md](docs/demands-v3.md)。
+
+## 仓库分工(V3)
+
+```
+preset-db(worker 写,基础数据 JSON)
+    ↓  构建脚本(读 preset-db,独立需求)
+Pages(构建产物,不进任何 repo)
+```
+
+worker **只产基础数据**(标量、只含我们关心的键)。切片器相关的一切形态转换 —— PrusaSlicer `.ini` 生成、字符串数组化(`"220"` → `["220"]`)、`_initial_layer` 伴随键、product name 版 `name`/`filament_settings_id` —— 全部由**构建脚本**负责,不在本仓库范围内。
+
+**唯一的例外是导入方向**:用户上传 Prusa `.ini` 时仍由 worker 解析回表格(见下)。
 
 ## 架构
 
 ```
-domain/profile.py        材料档案领域模型(序列化/校验,不依赖任何 SDK)
-domain/status.py         显式状态转换表(单次提交生命周期 + 终态判定)
-domain/submission.py     一次提交的领域对象 + 提交 ID 解析规则
-adapters/bitable.py      飞书 Bitable SDK 唯一入口(列名映射/过滤/schema 保障)
-adapters/git.py          Git 提供方适配器(GitHub/Gitea 纯 HTTP API,幂等)
+domain/profile.py         材料档案领域模型(canonical schema / 身份派生 / 序列化 / 校验)
+domain/status.py          显式状态转换表(单次提交生命周期 + 终态判定)
+domain/submission.py      一次提交的领域对象(状态流转,不落表、不留 id)
+domain/attachment_import.py  附件宽容取值(json/ini -> 列值)
+domain/slicer_import.py   PrusaSlicer .ini 导入映射表(worker 唯一保留的切片器知识)
+adapters/bitable.py       飞书 Bitable SDK 唯一入口(列名映射/schema 保障/附件下载)
+adapters/git.py           Git 提供方适配器(GitHub/Gitea 纯 HTTP API,幂等)
 services/submission_service.py  业务编排(校验 -> claim -> Git -> 回写,错误分流)
-worker.py                轮询 daemon(单记录异常隔离,daemon 级异常不终止)
-main.py                  dependency composition / 入口
-fields.py                Bitable 列名的唯一事实来源
+worker.py                 轮询 daemon(全表快照一次拉取,三阶段共用)
+config.py                 .env 读取与校验
+exceptions.py             领域异常(永久/瞬态分流)
+main.py                   dependency composition / 入口
+fields.py                 Bitable 列名的唯一事实来源
 ```
 
-## 触发链路(保持不变)
+## 触发链路
 
 ```
-按钮 ──> Automation 置「已请求」= true ──> worker 每 N 秒轮询 ──> 处理
+「提交审核」按钮 ──> Automation 写 提交人/提交时间 + 置「已请求」= true ──> worker 每 N 秒轮询 ──> 处理
 ```
 
-worker 每轮拉取全表后按 `已请求 = true` **本地过滤**取待处理行——实测飞书服务端公式/结构化过滤对复选框字段会静默返回空(语法合法、code=0 但匹配不到已勾选行),故不采用服务端过滤;表格量级小(单次分页 500 行)全表拉取成本可忽略。
+worker 每轮拉取全表后按 `已请求 = true` **本地过滤**取待处理行——实测飞书服务端公式/结构化过滤对复选框字段会静默返回空(语法合法、code=0 但匹配不到已勾选行),故不采用服务端过滤;表格量级小(单次分页 500 行)全表拉取成本可忽略。同一份全表快照依次交给三个阶段(提交处理 / 附件反写 / 审查同步),重复身份检测因此能拿到全表视角。
 
 ## 表格要求(建表指南)
 
-worker 启动时会自动补齐缺失的**文本/数字/附件**列(提交元数据列、`Profile JSON` 附件列与全部结构/耗材参数列,见下),但以下两列类型特殊,**需人工创建**,缺失时 worker 启动即报错:
+`ensure_schema` 把列分成两类:
+
+**A. 只校验不创建** —— 带选项或依赖表格其它配置的列,自动建空壳没有意义。缺列或类型不符一律**启动失败**并给出修复指引(飞书不支持改字段类型,需人工删除后重建):
 
 | 列名 | 类型 | 说明 |
 |---|---|---|
-| `状态` | 单选 | 选项需包含:`草稿/待处理/处理中/审核中/已通过/已拒绝/失败` |
-| `已请求` | 复选框 | 按钮 → Automation 置为已勾选 |
+| `状态` | 单选 | 选项须覆盖 `草稿/待处理/处理中/审核中/已通过/已拒绝/失败` |
+| `已请求` | 复选框 | 按钮 → Automation 置为已勾选(worker 清除) |
+| `提交审核` | 按钮 | 触发入口,需在 Automation 中配置「点击后置 提交人/提交时间/已请求」 |
+| `PI Code` | 单选 | 身份段 1,选项 = 全部料号(人工维护) |
+| `打印机型号` | 单选 | 身份段 2,**必须为「品牌 机型」形式**(如 `BBL P2S` / `Prusa Core One`) |
+| `切片软件` | 单选 | 身份段 3(选项人工维护,防止手输错字进路径) |
+| `调参方法版本` | 单选 | 如 `v1` / `v1_t1` |
+| `提交人` | 人员 | 由按钮 Automation 写入,worker 只读 |
+| `提交时间` | 日期 | 由按钮 Automation 写入,worker 只读 |
 
-> **列类型/选项校验(V2-P1)**:worker 启动时不仅检查 `状态` 列存在,还会按字段定义校验其**类型必须为单选**且**选项覆盖上述 7 个状态**,不符即启动失败并给出修复指引——飞书不支持直接把字段改成别的类型,需人工删除后用单选重建并重新配置选项;缺选项则人工在字段设置中补齐即可。
+**B. 缺列自动创建**(文本/数字/附件三类,无选项、无业务语义,补出来必然正确):
 
-### 数据列(V2-P4,一行 = 一种材料 × 一个机型配置)
+`继承预设`、`错误信息`、`PR URL`、`关闭理由`、`Profile JSON extract`(附件)、`过程记录`(附件)、`热床温度`、`喷嘴温度`、`冷却开启层时`、`最大风扇速度`、`最小风扇速度`、`降速层时`、`流量比例`、`最大体积流速`、`回抽距离`、`压力提前`、`线材密度`、`玻璃化温度`。
 
-- **结构参数(文本,必填)**:`品名`/`品牌`/`机型`/`切片器`。
-  `切片器` 白名单:`BambuStudio`/`Orcaslicer`/`OrcaSlicer`/`ElegooSlicer`/`CrealityPrint`
-  (PrusaSlicer 产物为 `.ini` 预设,暂不支持,填写即报错)。
-- **耗材参数(数字,必填 10 项)**:`线材密度`(g/cm³)/`软化温度`(°C)/`冷却开启层时`(秒)/
-  `最大风扇速度`(%)/`最小风扇速度`(%)/`降速层时`(秒)/`喷嘴温度`(°C)/`流量比例`/
-  `最大体积流速`(mm³/s)/`回抽距离`(mm)——键名与取值范围对齐 BambuStudio 官方 key registry。
-- **可选**:
-  - `材料ID`(文本):只作备注,不再参与文件名;Git JSON 里 `id` 缺省用品名;
-  - `压力提前`(数字):仅第三方机器适用;`品牌`=BBL(官方机型)时填写即报错;
-  - `继承预设`/`切片器版本`/`调参方法版本`/`PI Code`(文本):留空则 Git JSON 省略对应键;
-    PI Code 是预留 seam(将来映射为产品名),当前仅建模存储、**不进入 Git JSON**。
+表中**多出来的列**一律忽略,不报错、不修改。V2 时代的 `品名`/`品牌`/`机型`/`切片器`/`材料ID`/`切片器版本`/`提交 ID`/`重试次数` 已废弃,worker **不会**把它们建回来。
 
-手工填表与 JSON 附件导入共用同一份 canonical schema(`MaterialProfile`),没有两套规则;必填缺失/数值越界一律逐字段报错并落 `错误信息`,不会产生 Git 提交。
+### 必填 / 可选(V3-P2)
 
-## JSON 附件导入(上传 = 新建材料,V2-P4)
+- **必填(13 项)**:`PI Code`、`打印机型号`、`切片软件`、`调参方法版本`、`继承预设` + 8 项核心参数(`喷嘴温度`、`热床温度`、`流量比例`、`最大体积流速`、`冷却开启层时`、`最大风扇速度`、`最小风扇速度`、`降速层时`);
+- **可选(4 项)**:`线材密度`、`玻璃化温度`、`回抽距离`、`压力提前` —— 为空则该键不出现在输出文件里,由 `inherits` 继承父配置。
 
-用户可以把材料 Profile JSON 作为 `Profile JSON` 附件列上传(建行后挂附件即可,不必手动逐格输入);worker 每轮扫描**未进入提交生命周期**的行(状态空/`草稿`),满足「附件存在 + 标准字段有空位」就自动解析反写并**自动进入提交流程**:
+`继承预设` 为空即报错、**不生成 PR**。必填缺失/数值越界一律逐字段列名报错并落 `错误信息`,不会产生 Git 提交。
 
-- **严格单 JSON**:该列须恰好挂 1 个 `.json` 文件;无/多个 JSON、混入图片等其它文件一律报错,绝不静默选一个;
-- **键名规范(放宽)**:附件 JSON 只要含全部 14 个必填英文键(`name`/`brand`/`model`/`slicer` + 10 项耗材参数,键名同下节 Git 示例)就认为合法;**其余键一律忽略**——真实 BambuStudio 系文件的附加键(plate 温度、`filament_type`、`from` 等)不再报错;worker 派生键(`submission`/`generated_at`/`filament_settings_id`/`enable_pressure_advance`)由 worker 自己生成,附件携带同名键不读取;
-- **数值形态**:接受标量数字/数字字符串,也兼容 BambuStudio 系字符串数组(单元素 `["220"]` 或各值一致的 `["220","220"]`);含 `nil`/空、或多喷头取值不一致的数组报错提示改单值或手填——绝不静默挑一个值;输出到 Git 仍是标量;
-- **同一套校验**:附件 JSON 与手工填表共用 `MaterialProfile` + `validate()`(无两套业务规则);缺失必填、数值非法、越界都逐条报错;
-- **只填空格**:已填写的单元格绝不被附件覆盖;反写一次完成,失败不产生部分脏数据;
-- **自动提交(V2-P4)**:上传 JSON 一定是新建材料——反写成功(必填字段齐)即与清错误信息同一次原子回写置「已请求」,下一轮轮询走与按钮完全相同的常规流程(claim → Git 幂等提交 → `审核中` + PR),无需再点按钮;
-- **点按钮也不怕(V2-P4)**:若在反写轮处理前就点了「请求」(或上一轮反写失败后又补点),行被提交处理时必填仍空——worker 会在处理该行时**当场**先按附件反写(与反写轮共用同一解析与「只填空」规则)再继续提交,一次点击直达 PR,不会再落入「缺少必填字段」失败;附件本身有问题则永久失败并写明「附件解析失败」原因,替换/修正附件后重新点击即可(claim 会重新解析,不受反写轮去重限制);
-- **失败呈现**:解析/校验失败把原因(前缀「附件解析失败: …」)写入 `错误信息` 列,**不置「已请求」、不提交**;该附件(file_token)在 worker 进程内不重复尝试;替换附件或重启进程后自然重试,瞬时下载失败则下轮自动重试;
-- 字段已齐的行(人工填写完成)即使挂着附件也不解析、不自动提交;过程照片等 archive-only 列 worker 一律不读取。
+`压力提前` 是唯一带条件的可选列:打印机品牌为 `BBL` 时**忽略该值**(既不输出 `pressure_advance` 也不报错);其余品牌输出 `pressure_advance` + 派生键 `enable_pressure_advance: 1`。
+
+## 附件导入(宽容取值,V3-P3)
+
+建行后把切片器导出的文件挂到 `Profile JSON extract` 列即可,不必手动逐格输入。worker 每轮扫描**未进入提交生命周期**(状态空/`草稿`)且**尚有空格**的行,把认得的键反写进表格 —— 但**不自动提交**,是否提交由用户点「提交审核」决定。
+
+- **支持格式**:`.json`(键名 = canonical 英文键)与 PrusaSlicer `.ini`(扁平 `key = value`);该列须**恰好挂 1 个**附件,多个文件/混入图片等一律报错,绝不静默选一个;
+- **只找关心的键**:按 canonical 字段表逐键查找,找到就取值、**找不到就跳过**(不再因缺键报错)—— 真实 BambuStudio base 文件普遍缺 `nozzle_temperature`/`fan_cooling_layer_time`,V2 会因此整行失败,现在只反写它有的;
+- **一个关心的键都没认出来** → 静默跳过,不写错误、不反写;
+- **只填空格**:已填写的单元格绝不被附件覆盖;反写一次原子完成,失败不产生部分脏数据;
+- **单选列不从附件反写**(`PI Code`/`打印机型号`/`切片软件`/`调参方法版本`)—— 必须命中下拉选项,由人工手选;`继承预设` ← `inherits` 照常反写;
+- **数值形态**:接受标量数字/数字字符串,也兼容字符串数组(多喷头一行一个值)。数组**先剔除 `nil`/`null`/空槽位**(未启用的喷头,如 `["300","nil"]` → `300`),剩余值一致则取该值;**剔除后仍不一致**(如 `["220","240"]`)才跳过该键——绝不静默挑一个喷头的值;
+- **失败呈现**:格式不支持/非法 JSON/超限/下载失败 → 写 `错误信息`(前缀「附件解析失败: 」),不反写;确定性失败按 `(record_id, file_token)` 只尝试一次,换附件或重启后自然重试;瞬时下载失败下轮自动重试;
+- **点按钮时的兜底**:点「提交审核」的那一行若有空格且挂了附件,worker 会当场先做一次同样的反写再校验(规则完全一致)。附件坏了**不再是提交失败的理由** —— 表格数据齐全就照常提交,有空位就照常报「缺少必填字段」;
+- canonical 列全满的行视为人工填写完成,附件连读都不读。
+
+### PrusaSlicer `.ini` 导入映射(V3-P6)
+
+| PrusaSlicer key | 表格列 | 取值规则 |
+|---|---|---|
+| `temperature` | 喷嘴温度 | 优先取稳态值;缺失时回退 `first_layer_temperature`(真实文件两者常不等,如 200/210,表格只有一个温度列) |
+| `bed_temperature` | 热床温度 | 同上,回退 `first_layer_bed_temperature` |
+| `extrusion_multiplier` | 流量比例 | |
+| `filament_max_volumetric_speed` | 最大体积流速 | |
+| `fan_below_layer_time` | 冷却开启层时 | |
+| `slowdown_below_layer_time` | 降速层时 | |
+| `max_fan_speed` / `min_fan_speed` | 最大/最小风扇速度 | |
+| `filament_density` | 线材密度 | |
+| `filament_retract_length` | 回抽距离 | 值为 `nil` → 跳过(跟随打印机设置) |
+| `inherits` | 继承预设 | 原样反写 |
+
+Prusa 无对等键的(`temperature_vitrification`、写在 `start_filament_gcode` 里的 `M572` 压力提前)不反写。**输出侧对 Prusa 没有任何特殊分支** —— 与其他切片器走完全相同的代码路径,产出 `.json` 基础数据。
 
 ## 状态机
-
-一次「提交」的 worker 驱动生命周期:
 
 ```
 待处理 ──claim──> 处理中 ──Git 成功──> 审核中(记录 PR URL)──PR 合并──> 已通过
   │                │                                              └PR 关闭未合并──> 已拒绝
   └──永久失败──> 失败    └──瞬态失败──> 保持 处理中 + 已请求=true,自动重试(≤MAX_RETRIES)
-
-重复点击(行处于 审核中,V2-P0):
-  审核中 + 已请求=true ──确认在途 PR── 仍打开 ──> 保持 审核中(清除已请求,不建新 PR)
-                                        └─ 已合/已关 ──> 由本轮审查同步置 已通过/已拒绝
 ```
 
-- **瞬时故障**(Git/网络 5xx/429/限流等)绝不直接标失败:状态保持 `处理中`、`已请求` 置回 true,下一轮自动重试;超过 `MAX_RETRIES` 才置 `失败`。
-- **永久失败**(数据校验错误 / Git 鉴权失败等)直接置 `失败` 并写 `错误信息`,等用户修正后重新点击按钮。
-- **审查同步**:worker 每轮还检查所有 `审核中` 行,对照 Git 侧 PR 状态自动推进——
+- **瞬时故障**(Git/网络 5xx/429/限流等)绝不直接标失败:状态保持 `处理中`、`已请求` 置回 true,下一轮自动重试;超过 `MAX_RETRIES` 才置 `失败`。**重试计数只存在于 worker 进程内存**(表里已无「重试次数」列),重启清零,`错误信息` 仍写明重试情况。
+- **永久失败**(数据校验错误 / Git 鉴权失败 / 身份重复等)直接置 `失败` 并写 `错误信息`,等用户修正后重新点击按钮。
+- **审查同步**:worker 每轮检查所有 `审核中` 行,按行内 `PR URL` 对照 Git 侧 PR 实况——
   - PR **已合并** → `状态=已通过`;
-  - PR **关闭未合并**(人工撤销等)→ `状态=已拒绝`,并回写「关闭理由」(V2-P3);
-  - PR 仍打开 → 保持 `审核中`;Git 查询失败/找不到 PR 时保持 `审核中` 不误标,下轮自然重试。
-- **关闭理由(V2-P3)**:PR 关闭未合并时,worker 取**关闭前最后一条普通评论正文**写入 `关闭理由` 列;Git 侧无评论则写兜底文案「PR 已关闭,未说明原因」;评论读取失败(瞬时)→ 仍落 `已拒绝` 但理由留空、打印日志,由人工补充(不阻塞状态推进)。新一轮提交 claim 时自动清空上一轮残留的关闭理由。
-- 重复点击语义(V2-P0,按行当前状态区分):
-  - `待处理/处理中/失败` → **复用同一提交 ID**(同一 branch/PR,幂等更新);
-  - `审核中`(在途提交)→ **绝不开启新一轮、绝不产生第二个 PR**:worker 先确认该提交在 Git 上的实际 PR 状态——
-    PR 仍打开 → 保持 `审核中` 并清除请求信号,本次重复触发就此打住;
-    PR 已合并 / 已关闭未合并 → 交回本轮随后的审查同步,落 `已通过 / 已拒绝`(关闭理由见 V2-P3);
-    Git 上查不到该 PR → 保持 `审核中`、清除请求信号并一次性告警,需人工处理;
-    查询失败(瞬时)→ 不动行,下轮自动重试。
-  - `已通过/已拒绝`(上一轮提交已收尾)→ **开启新一轮提交**(新提交 ID / 新 branch / 新 PR);新一轮 claim 时会清空上一轮留下的「关闭理由」(V2-P3)。
-  - 快速双击:两次点击落在同一轮询周期内只置一次 `已请求=true`,只处理一次、只产生一个 PR。
+  - PR **关闭未合并** → `状态=已拒绝`,并回写「关闭理由」;
+  - PR 仍打开 / 查不到 → 保持 `审核中` 不误标,下轮自然重试。
+- **关闭理由**:PR 关闭未合并时取**关闭前最后一条普通评论正文**;Git 侧无评论则写兜底「PR 已关闭,未说明原因」;评论**读取失败**(权限/网络/响应异常)→ 仍落 `已拒绝`(不阻塞状态推进),但格子里写**可区分的占位文案**「(关闭理由读取失败,请查看 worker 日志: <异常摘要>)」并打印日志 —— 绝不留空,因为空着跟「确实没人写理由」在表上分不出来,而失败成因常是**永久性**的(见下 `GIT_ACCESS_TOKEN` 权限),行落终态后 worker 不再回看,理由就永久丢了。新一轮提交 claim 时自动清空上一轮残留的理由。
 
-## 幂等与重试(P4)
+### 重复点击语义
 
-- 每次提交有稳定 `提交 ID`(写回 Bitable `提交 ID` 列),branch 名由其确定:`material/<提交ID>`。
-- `GitRepository.submit_profile()` 先查既有 PR,存在即复用;**Git 成功但 Bitable 回写失败**后自动重试,只会收敛到同一个 PR,绝不产生重复 PR。
-- 文件内容与远端一致时不产生空提交;与默认分支完全一致(如已合并后无改动再次提交)不会建空 PR,会以失败提示。
-- claim 后回读校验,多 worker 并发时后写者获胜,败者让行;双 worker 强互斥依赖 Bitable 无 CAS 不支持,**生产建议单 worker 部署**。
+| 行当前状态 | 行为 |
+|---|---|
+| `待处理`/`处理中`/`失败` | 常规处理(claim → Git 幂等提交) |
+| `审核中` | **绝不开启新一轮、绝不产生第二个 PR**:先确认 `PR URL` 指向 PR 的实况 —— 仍打开 → 保持 `审核中` 并清除请求信号;已合并/已关闭 → 交回本轮审查同步落终态;查不到 → 保持 `审核中`、清除请求信号并一次性告警;查询失败(瞬时)→ 不动行,下轮重试。`PR URL` 为空 → 清请求 + 告警,绝不贸然开第二个 PR |
+| `已通过`/`已拒绝` | **开启新一轮提交**(同一 branch 上打新 commit + 开新 PR) |
+
+快速双击:两次点击落在同一轮询周期内只置一次 `已请求=true`,只处理一次、只产生一个 PR。
+
+## 行身份与幂等(V3-P4/P5/P9)
+
+- **身份** = `PI Code × 打印机型号 × 切片软件`(三元组),`identity = "<PI Code>@<打印机型号>"`;
+- **branch** = `material/<身份>_<切片软件>`,空格折叠为 `_`(如 `material/L1002@BBL_P2S_BambuStudio`)。同一行永远同一 branch → 重复点击/瞬态重试天然收敛到同一 branch 与同一 PR;
+- **PR 锚点**是行内的 `PR URL` 列(表里没有「提交 ID」)。同一 branch 上会累积多轮历史 PR,所以审查同步按 `PR URL` 解析出的 PR 编号查询,只有在 `PR URL` 为空时才回退到「该 branch 上处于打开状态的 PR」;
+- **重复身份** → 该行永久失败并写明与哪一行冲突,**不产生 PR**(先进入处理的行正常提交);
+- **空 PR 保护**:文件内容与默认分支完全一致(如已合并后无改动再次提交)时不建空 PR,报明确错误;
+- **并发**:claim 后回读校验,多 worker 并发时后写者获胜、败者让行;真正的安全网是「branch 由身份派生 + Git 幂等」,**生产仍建议单 worker 部署**。
 
 ## 环境变量
 
@@ -114,46 +150,88 @@ worker 启动时会自动补齐缺失的**文本/数字/附件**列(提交元数
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | ✅ | 飞书自建应用 |
 | `FEISHU_APP_TOKEN` / `FEISHU_TABLE_ID` | ✅ | 目标多维表格 |
 | `GIT_REPOSITORY_URL` | ✅ | Git 仓库 **https** URL(SSH 形式不支持,HTTP API 模式需要 token)。host 为 github.com 走 GitHub API,其余按 Gitea `/api/v1` |
-| `GIT_ACCESS_TOKEN` | ✅ | GitHub / Gitea Personal Access Token(仓库读写权限) |
+| `GIT_ACCESS_TOKEN` | ✅ | GitHub / Gitea Personal Access Token。**除仓库读写外还需 issue 读取权限**:关闭理由取自 PR 评论(`GET /issues/{n}/comments`),Gitea token 缺 `read:issue` 时该端点一律 403 —— 这与仓库是否公开无关(匿名可读 ≠ 该 token 有权限),缺了它只会表现为「关闭理由写不回来」 |
 | `POLL_INTERVAL` | 默认 5 | 轮询间隔(秒) |
 | `MAX_RETRIES` | 默认 5 | 瞬态失败自动重试上限 |
 
-## Git 仓库内容
+## Git 仓库内容(V3-P4)
 
-每次提交写一个文件(可重复提交/更新同一路径,由 PR 串联审查);目录布局照搬 Polymaker-Preset 实况(V2-P4),品名/品牌/机型/切片器各为一段目录,空格与中文原样保留:
+每次提交写一个文件(可重复提交/更新同一路径,由 PR 串联审查)。布局:
 
 ```
-preset/<品名>/<品牌>/<机型>/<切片器>/<品名> @<品牌> <机型>.json
+preset/<PI Code>/<品牌>/<机型>/<切片软件>/<PI Code>@<品牌> <机型>.json
 ```
 
-文件内容 = 材料档案 + worker 派生的提交溯源(数值为标量,整数不写 `.0`;
-`name`/`filament_settings_id`/文件名主干 = worker 派生的复合名 `<品名> @<品牌> <机型>`,品名不单独成键;`pi_code` 等纯输入备注不进入文件):
+品牌/机型由 `打印机型号` 按**第一个空格**切分(首词 = 品牌,其余原样 = 机型,故 `Creality K2 Pro` → `Creality` / `K2 Pro`),空格与大小写原样保留;worker **不带**任何品牌映射表。**所有切片器统一 `.json`**:
+
+```
+preset/L1002/BBL/P2S/BambuStudio/L1002@BBL P2S.json
+preset/L1002/BBL/P2S/OrcaSlicer/L1002@BBL P2S.json
+preset/L1002/Prusa/Core One/PrusaSlicer/L1002@Prusa Core One.json
+```
+
+文件内容 = 基础数据(**只有材料数据,不含任何 worker 溯源键**;数值为**标量**,整数不写 `.0`;不写 `id`/`filament_settings_id`/`_initial_layer` 类伴随键 —— 那些留给构建阶段):
 
 ```json
 {
-  "id": "Test PLA",
-  "name": "Test PLA @BBL H2C",
-  "brand": "BBL",
-  "model": "H2C",
+  "name": "L1002@BBL P2S",
+  "pi_code": "L1002",
+  "printer": "BBL P2S",
   "slicer": "BambuStudio",
-  "filament_settings_id": "Test PLA @BBL H2C",
-  "filament_density": 1.24,
-  "temperature_vitrification": 59,
-  "fan_cooling_layer_time": 100,
-  "fan_max_speed": 100,
-  "fan_min_speed": 100,
-  "slow_down_layer_time": 8,
+  "inherits": "Panchroma PLA",
+  "pm_method_version": "v1",
+  "textured_plate_temp": 55,
   "nozzle_temperature": 220,
-  "filament_flow_ratio": 0.98,
-  "filament_max_volumetric_speed": 16,
+  "fan_cooling_layer_time": 20,
+  "fan_max_speed": 60,
+  "fan_min_speed": 0,
+  "slow_down_layer_time": 4,
+  "filament_flow_ratio": 0.95,
+  "filament_max_volumetric_speed": 18,
+  "filament_density": 1.17,
+  "temperature_vitrification": 60,
   "filament_retraction_length": 0.4,
-  "submission": "a1b2c3…",
-  "generated_at": "2026-09-06T12:00:00+08:00"
+  "pressure_advance": 0.02,
+  "enable_pressure_advance": 1
 }
 ```
 
-可选键按是否填写出现:`inherits`/`version`/`pm_method_version`;
-填了 `压力提前`(仅第三方机器)时额外输出 `pressure_advance` 与派生开关 `enable_pressure_advance: 1`。
+- `pi_code`/`printer`/`slicer` 独立成键 —— 供构建阶段拼 product name 版 preset;
+- 可选键按是否填写出现;`inherits` 必填故恒在;
+- **文件里没有任何 worker 溯源键**:`submission`(每轮 uuid)/`generated_at` 已废弃删除 —— 文件里每一行都是材料数据;谁在什么时候改了什么,由 PR 正文与 commit message 交代(见下);
+- 热床温度只写 `textured_plate_temp` 一个键。
+
+### commit message 与 PR(V3-P7/P8)
+
+commit message:
+
+```
+[材料] L1002@BBL P2S (BambuStudio)
+
+提交人: 张三 · 提交时间: 2026-09-11 10:23
+
+过程记录:
+- 2026-09-10_温度塔.jpg
+- 2026-09-10_流量校准.jpg
+```
+
+PR 正文 = **首行身份 + 人话版字段差异 + 提交人/时间**。差异由「默认分支上的现状」与「本次内容」逐键比对得出(两者本来就要读,不额外发请求),标签用表格列名、数值带单位:
+
+```
+L1002@BBL P2S · BambuStudio
+
+喷嘴温度: 220 °C → 215 °C
+流量比例: 0.95 → 0.92
+回抽距离: (未设置) → 0.4 mm
+
+提交人: 张三 · 提交时间: 2026-09-11 10:23
+```
+
+- 首次提交(默认分支上还没有该档案)无旧值可比 —— 列出全部取值、不带箭头;某个键原先没有(如刚填上的可选参数)/现在没有了,另一侧写 `(未设置)`;
+- **身份四要素不重复列出**(每个文件路径下恒定,首行已交代),派生键 `enable_pressure_advance` 也不列(`压力提前` 讲一遍就够);
+- 没动的字段不出现 —— 审查者一眼看到这次改了什么,不必自己点开 diff 逐键比对;全文件一致时根本不会建 PR(空变更保护);
+- `提交人`/`提交时间` 由 worker 在 claim 时读出(人员列取姓名,日期列按本地时间格式化),**不修改这两列**;为空写 `(未记录)`,不影响提交。Git 的 author 字段不做改动;
+- `过程记录` 列的附件**不下载、不进仓库**,只取文件名写进 commit message;PR 创建成功后**清空该列** —— 改动与记录的对应关系由 Git 历史承载。
 
 ## 运行与测试
 
@@ -163,4 +241,4 @@ material-worker            # 或 python -m material_worker.main
 python -m pytest tests/ -v
 ```
 
-worker 启动即检查表格 schema,缺列自动补;核心测试用 fake 的 Bitable/Git 适配器,不触网、不需要真实凭证。
+worker 启动即检查表格 schema(缺列自动补、特殊列启动失败);核心测试用 fake 的 Bitable/Git 适配器,不触网、不需要真实凭证。
