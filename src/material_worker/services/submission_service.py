@@ -349,6 +349,20 @@ class SubmissionService:
             if str(row_fields.get(column) or "").strip() == ""
         }
 
+    @staticmethod
+    def _import_payload(values: dict[str, Any]) -> dict[str, Any]:
+        """导入成功的一次原子写:填上的值 + 清历史错误 + **清空附件格**。
+
+        V3-P3(用户确认):附件列是**一次性导入入口**,不是长期挂在行上的
+        数据源 —— 值既已落进表格,原件就该让位。留着它会反噬:用户随后
+        清空/改动某个格子(想改值、想让可选参数留空走继承),只要该格变空,
+        附件就会被再读一遍并把它填回旧值(worker 重启后 `_json_parse_attempted`
+        清零,必然再发生一次),手改反复被覆盖。
+
+        「过程记录」是同一套语义:用完即清,原件不进 Git、不留表。
+        """
+        return {**values, fields.ERROR_MSG: "", fields.PROFILE_JSON: []}
+
     def _backfill_one(
         self, record_id: str, row_fields: dict[str, Any]
     ) -> None:
@@ -382,17 +396,19 @@ class SubmissionService:
         self._json_parse_attempted.add(attempt_key)
         values = self._fill_values(row_fields, parsed)
         if not values:
-            # 一个关心的键都没认出来 -> 静默跳过(不写错误、不反写)
+            # 一个关心的键都没认出来 -> 静默跳过(不写错误、不反写、
+            # **不清附件格**:没提取到任何东西就删掉用户的文件太粗暴)
             print(
                 f"[附件导入] record={record_id} 附件 {item.name!r} "
-                f"未包含任何关心的键,跳过"
+                f"未包含任何关心的键,跳过(附件保留)"
             )
             return
 
-        values[fields.ERROR_MSG] = ""  # 成功清掉历史解析错误
         try:
             # 一次原子反写:不产生部分脏数据
-            self.bitable.update_record(record_id, values)
+            self.bitable.update_record(
+                record_id, self._import_payload(values)
+            )
         except Exception as exc:
             print(f"[严重错误] 附件反写失败 record={record_id}: {exc}")
             self._json_parse_attempted.discard(attempt_key)  # 下轮自愈重试
@@ -400,7 +416,8 @@ class SubmissionService:
         # V3-P3:不再置「已请求」—— 是否提交由用户点按钮决定
         print(
             f"[附件导入] record={record_id} 由附件 {item.name!r} 反写 "
-            f"{len(values) - 1} 个字段(只填空,不自动提交)"
+            f"{len(values)} 个字段(只填空,不自动提交),"
+            f"并清空「{fields.PROFILE_JSON}」列"
         )
 
     @staticmethod
@@ -455,7 +472,8 @@ class SubmissionService:
         V3-P3:附件问题**不再是提交失败的理由** —— 附件只是省手输的
         便捷入口,提交本身由用户点按钮决定。因此:
 
-        - 解析成功 -> 反写落表并把值合并进本次校验的快照;
+        - 解析成功 -> 反写落表(与轮询路径一样用完即清空附件格,见
+          `_import_payload`)并把值合并进本次校验的快照;
         - 文件级问题/瞬时失败 -> 记日志后按原行数据继续,该报缺字段
           就报缺字段(用户看得懂,且修正后重新点击即可)。
 
@@ -477,9 +495,9 @@ class SubmissionService:
         values = self._fill_values(row_fields, parsed)
         if not values:
             return row_fields
-        values[fields.ERROR_MSG] = ""
+        payload = self._import_payload(values)
         try:
-            self.bitable.update_record(record_id, values)
+            self.bitable.update_record(record_id, payload)
         except Exception as exc:
             print(
                 f"[严重错误] 提交前附件反写失败 record={record_id},"
@@ -488,9 +506,10 @@ class SubmissionService:
             return {**row_fields, **values}
         print(
             f"[附件导入(提交路径)] record={record_id} 由附件 {item.name!r} "
-            f"反写 {len(values) - 1} 个字段 -> 继续常规提交"
+            f"反写 {len(values)} 个字段,并清空「{fields.PROFILE_JSON}」列"
+            f" -> 继续常规提交"
         )
-        return {**row_fields, **values}
+        return {**row_fields, **payload}
 
     # ------------------------------------------------------------------
     def process_record(

@@ -1191,6 +1191,54 @@ def test_backfill_skips_rows_with_complete_fields():
     assert bitable.download_tokens == []
 
 
+def test_backfill_clears_attachment_cell_after_import():
+    """V3:附件是**一次性导入入口** —— 提取完即清空该格。
+
+    动机(用户确认):留着附件,之后任何一次手改(改值、或清空某格想让
+    可选参数走继承)只要让格子变空,就会被再读一遍填回旧值;重启后
+    `_json_parse_attempted` 清零,更是一定会再发生一次。
+    """
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = valid_file().encode("utf-8")
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.backfill_pending_json_rows(bitable.list_records())
+
+    row = bitable.records["rec-1"]
+    assert row[fields.NOZZLE_TEMP] == 220  # 值已落表
+    assert row[fields.PROFILE_JSON] == []  # 附件格已清空
+
+    # 用户随后手动清空某个格子 -> 没有任何附件能把它填回来
+    row[fields.NOZZLE_TEMP] = ""
+    service.backfill_pending_json_rows(bitable.list_records())
+    assert bitable.records["rec-1"][fields.NOZZLE_TEMP] == ""
+    assert bitable.download_tokens == ["tok-1"]  # 也没有再下载一次
+
+
+def test_backfill_keeps_attachment_when_it_yields_nothing():
+    """一个关心的键都没认出来 -> 静默跳过,**不删用户的原件**。"""
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = b'{"unrelated": 1}'
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.backfill_pending_json_rows(bitable.list_records())
+
+    assert bitable.records["rec-1"][fields.PROFILE_JSON] == attach()
+
+
+def test_backfill_keeps_attachment_on_parse_failure():
+    """附件坏了 -> 写错误信息、保留附件,用户换一个附件即可自然重试。"""
+    bitable = FakeBitable("rec-1", json_draft_row(attachment=attach()))
+    bitable.attachments["tok-1"] = b"{broken json"
+    service = SubmissionService(bitable=bitable, repository=FakeGitRepository())
+
+    service.backfill_pending_json_rows(bitable.list_records())
+
+    row = bitable.records["rec-1"]
+    assert row[fields.ERROR_MSG].startswith(JSON_PARSE_ERROR_PREFIX)
+    assert row[fields.PROFILE_JSON] == attach()
+
+
 def test_backfill_reads_attachment_when_only_optional_columns_blank():
     """必填已齐、可选列空 -> 附件仍值得读一次(可选值正是附件常带的内容)。"""
     bitable = FakeBitable("rec-1", json_draft_row(attachment=attach(), **row_fields()))
@@ -1303,6 +1351,7 @@ def test_requested_row_with_attachment_fills_and_submits_in_one_call():
     assert row[fields.STATUS] == SubmissionStatus.REVIEWING.value
     assert row[fields.REQUESTED] is False
     assert row[fields.ERROR_MSG] == ""
+    assert row[fields.PROFILE_JSON] == []  # V3:提取完即清空附件格
     assert len(repo.pull_requests) == 1
     assert bitable.download_tokens == ["tok-1"]
 
