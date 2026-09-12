@@ -4,6 +4,10 @@ Feishu Bitable 按钮 → Automation 写入 `提交人`/`提交时间` 并置 `�
 
 Git 仓库是材料档案的唯一真相源(不引入数据库)。需求见 [docs/demands-v3.md](docs/demands-v3.md)。
 
+BambuStudio 侧的预设装载/导入行为事实(带源码行号与复现命令,待逐条确认)见 [docs/bambustudio-preset-loading-findings.md](docs/bambustudio-preset-loading-findings.md)。
+
+**v4 需求见 [docs/profile-validation-rules.md](docs/profile-validation-rules.md)**(构建 + 校验两个脚本,进 CI)。
+
 ## 仓库分工(V3)
 
 ```
