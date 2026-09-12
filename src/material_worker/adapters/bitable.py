@@ -18,11 +18,11 @@ from lark_oapi.api.bitable.v1 import (
 from lark_oapi.api.drive.v1 import DownloadMediaRequest
 
 from material_worker import fields
+from material_worker.adapters.lark_transport import call_lark
 from material_worker.domain.status import SubmissionStatus
 from material_worker.exceptions import (
     BitableError,
     PermanentError,
-    RetryableError,
 )
 
 # Feishu Bitable 字段 type:1=文本 2=数字 3=单选 4=多选 5=日期 7=复选框
@@ -118,10 +118,6 @@ _VALIDATE_ONLY_FIELDS: dict[str, tuple[int, str]] = {
 _STATUS_REQUIRED_OPTIONS: list[str] = [s.value for s in SubmissionStatus]
 
 
-def _make_callable_error(exc: Exception) -> RetryableError:
-    return RetryableError(f"Bitable 请求失败(网络/超时): {type(exc).__name__}: {exc}")
-
-
 def _type_label(field_type: object) -> str:
     try:
         return _FIELD_TYPE_LABELS.get(int(field_type), f"未知(type={field_type})")
@@ -131,10 +127,16 @@ def _type_label(field_type: object) -> str:
 
 @dataclass(frozen=True)
 class AttachmentItem:
-    """附件单元格里的一项(附件列原始值形态的适配层归一化)。"""
+    """附件单元格里的一项(附件列原始值形态的适配层归一化)。
+
+    `size` = 单元格里报告的文件字节数,可能缺失(缺失时为 None)。它是
+    **下载前**唯一能做体积预检的依据 —— `media.download` 会把整个响应体
+    缓冲进内存,等拿到 bytes 再判断就已经晚了。
+    """
 
     file_token: str
     name: str
+    size: int | None = None
 
 
 def person_names(cell: Any) -> list[str]:
@@ -201,23 +203,9 @@ class BitableClient:
     # 通用调用包装
     # ------------------------------------------------------------------
     def _call(self, fn: Callable[[], Any], action: str) -> Any:
-        try:
-            resp = fn()
-        except RetryableError:
-            raise
-        except Exception as exc:  # lark SDK 在传输层抛出的异常
-            raise _make_callable_error(exc) from exc
-
-        if not resp.success():
-            code, msg = resp.code, resp.msg
-            if code == 99991400:  # 访问频繁/系统繁忙
-                raise RetryableError(
-                    f"Bitable {action} 被限流: code={code}, msg={msg}"
-                )
-            raise BitableError(
-                f"Bitable {action} failed: code={code}, msg={msg}"
-            )
-        return resp
+        return call_lark(
+            fn, action, surface="Bitable", error_cls=BitableError
+        )
 
     # ------------------------------------------------------------------
     # 读记录
@@ -290,7 +278,17 @@ class BitableClient:
             name = entry.get("name")
             if token is None or name is None:
                 continue
-            items.append(AttachmentItem(file_token=str(token), name=str(name)))
+            size = entry.get("size")
+            items.append(
+                AttachmentItem(
+                    file_token=str(token),
+                    name=str(name),
+                    # bool 是 int 的子类,但 True 不是字节数 —— 当缺失处理
+                    size=size
+                    if isinstance(size, int) and not isinstance(size, bool)
+                    else None,
+                )
+            )
         return items
 
     def download_attachment(self, file_token: str) -> bytes:
@@ -333,15 +331,6 @@ class BitableClient:
     def submit_time_text(row_fields: dict[str, Any]) -> str:
         """「提交时间」列 -> 本地时间文本;空 -> "(未记录)"。"""
         return date_text(row_fields.get(fields.SUBMIT_TIME)) or "(未记录)"
-
-    # ------------------------------------------------------------------
-    # V3-P8:过程记录(只取文件名,附件本体不进 Git)
-    # ------------------------------------------------------------------
-    def process_record_names(self, row_fields: dict[str, Any]) -> list[str]:
-        return [
-            item.name
-            for item in self.attachment_items(row_fields, fields.PROCESS_RECORD)
-        ]
 
     def get_record(self, record_id: str) -> tuple[str, dict[str, Any]]:
         request = (
@@ -413,8 +402,8 @@ class BitableClient:
         """Git 提交成功:状态=审核中,记录 PR URL,清空错误信息。
 
         V3-P8:PR 建立成功后,与本次回写一并清空「过程记录」列 ——
-        附件本体不进 Git,只在 commit message 里留下文件名,改动与记录
-        的对应关系由 Git 历史承载(用户确认的语义)。
+        附件本体不进 Git,只在 PR 正文里留下文件名,改动与记录的
+        对应关系由那一轮的 PR 承载(用户确认的语义)。
         """
         values: dict[str, Any] = {
             fields.REQUESTED: False,

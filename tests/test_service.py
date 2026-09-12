@@ -3,8 +3,10 @@
 V3 重点:
 - 附件导入改为**宽容取值 + 不自动提交**(P3):只反写认得的键,缺键跳过,
   是否提交由用户点按钮决定;
-- 提交人 / 提交时间 / 过程记录写进 commit message 与 PR(P7/P8),
+- 提交人 / 提交时间写进 commit message,过程记录只写进 PR 正文(P7/P8),
   成功后清空「过程记录」列;
+- 过程记录先上传云文档**再**建 PR(P10):上传失败则本轮不建 PR、不清列
+  (fail-closed,证据优先于 PR);
 - 重复身份(PI Code × 打印机型号 × 切片软件)永久失败(P9);
 - 表里没有「提交 ID」「重试次数」列:PR URL 是唯一锚点,重试计数只在内存。
 """
@@ -80,10 +82,14 @@ class FakeBitable:
                 continue
             if entry.get("file_token") is None or entry.get("name") is None:
                 continue
+            size = entry.get("size")
             items.append(
                 AttachmentItem(
                     file_token=str(entry["file_token"]),
                     name=str(entry["name"]),
+                    size=size
+                    if isinstance(size, int) and not isinstance(size, bool)
+                    else None,
                 )
             )
         return items
@@ -95,9 +101,6 @@ class FakeBitable:
         if file_token not in self.attachments:
             raise BitableError(f"附件不存在: {file_token}")
         return self.attachments[file_token]
-
-    def process_record_names(self, row_fields):
-        return [i.name for i in self.attachment_items(row_fields, fields.PROCESS_RECORD)]
 
     # 复用真实实现的展示文本规则(纯静态,无副作用)
     submitter_text = staticmethod(BitableClient.submitter_text)
@@ -208,6 +211,7 @@ class FakeGitRepository:
         submitter="(未记录)",
         submit_time="(未记录)",
         process_records=(),
+        process_records_folder_url="",
     ):
         branch = GitRepository.branch_name_for(profile.identity, profile.slicer)
         self.submit_calls.append(branch)
@@ -218,6 +222,7 @@ class FakeGitRepository:
                 "submitter": submitter,
                 "submit_time": submit_time,
                 "process_records": list(process_records),
+                "process_records_folder_url": process_records_folder_url,
             }
         )
         if self.next_error and self.next_error_times > 0:
@@ -267,8 +272,12 @@ def reviewing_row(record_id="rec-1", token="sid-1"):
     return row
 
 
-def attach(name="profile.json", token="tok-1"):
-    return [{"file_token": token, "name": name}]
+def attach(name="profile.json", token="tok-1", size=None):
+    """附件单元格的一格;size 缺省时不写这个键(镜像飞书「可能不给体积」)。"""
+    entry = {"file_token": token, "name": name}
+    if size is not None:
+        entry["size"] = size
+    return [entry]
 
 
 # ======================================================================
@@ -1526,3 +1535,316 @@ def test_requested_row_blank_with_ini_attachment_submits():
     assert submission["profile"].repo_relative_path() == (
         "preset/L1002/Prusa/Core One/PrusaSlicer/L1002@Prusa Core One.json"
     )
+
+
+# ======================================================================
+# V3-P10:过程记录上传云文档(fail-closed)
+# ======================================================================
+class FakeDrive:
+    """内存版 DriveClient:记录每次 publish,可注入失败。"""
+
+    def __init__(self, max_file_bytes=20 * 1024 * 1024):
+        self.max_file_bytes = max_file_bytes
+        self.publish_calls: list[tuple[tuple[str, ...], list[str]]] = []
+        self.events: list[str] = []
+        self.next_error: Exception | None = None
+        self.next_error_times = 0
+        self.uploaded: dict[str, dict[str, bytes]] = {}  # leaf -> {name: bytes}
+
+    def publish(self, folder_path, uploads):
+        self.publish_calls.append((tuple(folder_path), [u.name for u in uploads]))
+        self.events.append("publish")
+        if self.next_error and self.next_error_times > 0:
+            self.next_error_times -= 1
+            raise self.next_error
+
+        leaf = folder_path[-1]
+        folder = self.uploaded.setdefault(leaf, {})
+        uploaded = skipped = 0
+        for item in uploads:
+            if item.name in folder:
+                skipped += 1
+                continue
+            folder[item.name] = item.content
+            uploaded += 1
+
+        from material_worker.adapters.lark_drive import DrivePublishResult
+
+        return DrivePublishResult(
+            folder_token=f"fld-{leaf}",
+            folder_url=f"https://jfpolymers.feishu.cn/drive/folder/fld-{leaf}",
+            uploaded=uploaded,
+            skipped=skipped,
+        )
+
+
+def process_row(name="调参记录.md", token="rec-tok", size=None, content=b"photo"):
+    """一行带一个过程记录附件的快照 + 配好下载字节的 FakeBitable。"""
+    row = snapshot()
+    row[fields.PROCESS_RECORD] = attach(name=name, token=token, size=size)
+    bitable = FakeBitable("rec-1", row)
+    bitable.attachments[token] = content
+    return bitable
+
+
+def test_process_records_uploaded_before_pr_and_linked():
+    bitable = process_row()
+    repo = FakeGitRepository()
+    drive = FakeDrive()
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    sent = repo.submissions[0]
+    assert sent["process_records"] == ["调参记录.md"]
+    assert sent["process_records_folder_url"].startswith(
+        "https://jfpolymers.feishu.cn/drive/folder/"
+    )
+    # 上传发生在建 PR 之前
+    assert drive.events == ["publish"]
+    assert len(repo.submit_calls) == 1
+
+
+def test_process_records_upload_uses_downloaded_bytes():
+    bitable = process_row(content=b"the-photo-bytes")
+    drive = FakeDrive()
+    service = SubmissionService(
+        bitable=bitable, repository=FakeGitRepository(), drive=drive
+    )
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    leaf = drive.publish_calls[0][0][-1]
+    assert drive.uploaded[leaf]["调参记录.md"] == b"the-photo-bytes"
+    assert bitable.download_tokens == ["rec-tok"]
+
+
+def test_upload_failure_blocks_pr_creation():
+    """fail-closed:上传失败 -> 一个 PR 都不建,列保留,行可重试。"""
+    bitable = process_row()
+    repo = FakeGitRepository()
+    drive = FakeDrive()
+    drive.next_error = RetryableError("云文档 500")
+    drive.next_error_times = 1
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert repo.submit_calls == []
+    assert repo.pull_requests == {}
+    assert row[fields.STATUS] == SubmissionStatus.PROCESSING.value
+    assert row[fields.REQUESTED] is True
+    assert service._retry_counts == {"rec-1": 1}
+    # 附件列原样保留 —— 下一轮重试还要靠它
+    assert row[fields.PROCESS_RECORD] != []
+    assert bitable.cleared_process_record == []
+
+
+def test_upload_permanent_failure_fails_row_without_pr():
+    bitable = process_row()
+    repo = FakeGitRepository()
+    drive = FakeDrive()
+    drive.next_error = PermanentError("目录不可写")
+    drive.next_error_times = 99
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert repo.submit_calls == []
+    assert row[fields.STATUS] == SubmissionStatus.FAILED.value
+    assert "目录不可写" in row[fields.ERROR_MSG]
+
+
+def test_upload_failure_exhausts_budget_then_fails():
+    """上传与 Git 共用同一份重试预算。"""
+    bitable = process_row()
+    repo = FakeGitRepository()
+    drive = FakeDrive()
+    drive.next_error = RetryableError("云文档超时")
+    drive.next_error_times = 99
+    service = SubmissionService(
+        bitable=bitable, repository=repo, drive=drive, max_retries=2
+    )
+
+    for _ in range(3):
+        row = bitable.records["rec-1"]
+        if row[fields.STATUS] == SubmissionStatus.FAILED.value:
+            break
+        row[fields.REQUESTED] = True
+        service.process_record("rec-1", dict(row))
+
+    assert repo.submit_calls == []
+    assert bitable.records["rec-1"][fields.STATUS] == SubmissionStatus.FAILED.value
+
+
+def test_retry_reuses_same_folder_path():
+    """整轮重试必须落回同一个目录,否则每次重试都重新全量上传。"""
+    bitable = process_row()
+    repo = FakeGitRepository()
+    drive = FakeDrive()
+    drive.next_error = RetryableError("云文档 500")
+    drive.next_error_times = 1
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+    bitable.records["rec-1"][fields.REQUESTED] = True
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    assert len(drive.publish_calls) == 2
+    assert drive.publish_calls[0][0] == drive.publish_calls[1][0]
+    # 第二次不该重复上传同一个文件
+    leaf = drive.publish_calls[0][0][-1]
+    assert list(drive.uploaded[leaf]) == ["调参记录.md"]
+
+
+def test_drive_disabled_keeps_v3_p8_behavior():
+    """未配置云文档 -> 退回只列文件名,但列照常清空。"""
+    bitable = process_row()
+    repo = FakeGitRepository()
+    service = SubmissionService(bitable=bitable, repository=repo)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    sent = repo.submissions[0]
+    assert sent["process_records"] == ["调参记录.md"]
+    assert sent["process_records_folder_url"] == ""
+    assert bitable.cleared_process_record == ["rec-1"]
+
+
+def test_oversized_attachment_fails_without_downloading():
+    """单元格里的 size 超限 -> 下载前就拦下(内存里不该出现这个文件)。"""
+    bitable = process_row(size=25 * 1024 * 1024)
+    repo = FakeGitRepository()
+    drive = FakeDrive()
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.FAILED.value
+    assert "25.0MB" in row[fields.ERROR_MSG]
+    assert bitable.download_tokens == []
+    assert drive.publish_calls == []
+    assert repo.submit_calls == []
+
+
+def test_oversized_attachment_caught_after_download_when_size_missing():
+    """单元格没给 size 时的兜底:下载后按实际字节数拦。"""
+    bitable = process_row(content=b"x" * 2048)
+    repo = FakeGitRepository()
+    drive = FakeDrive(max_file_bytes=1024)
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    row = bitable.records["rec-1"]
+    assert row[fields.STATUS] == SubmissionStatus.FAILED.value
+    assert drive.publish_calls == []
+    assert repo.submit_calls == []
+
+
+def test_upload_uses_claim_fresh_snapshot_tokens():
+    """附件取 claim 时的最新快照(Automation 与「已请求」同一次写入)。"""
+    row = snapshot()
+    bitable = FakeBitable("rec-1", row)
+    bitable.attachments["fresh-tok"] = b"fresh"
+    original_get = bitable.get_record
+
+    def get_record(record_id):
+        rid, fresh = original_get(record_id)
+        fresh[fields.PROCESS_RECORD] = attach(name="新照片.jpg", token="fresh-tok")
+        return rid, fresh
+
+    bitable.get_record = get_record
+    drive = FakeDrive()
+    service = SubmissionService(
+        bitable=bitable, repository=FakeGitRepository(), drive=drive
+    )
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    assert bitable.download_tokens == ["fresh-tok"]
+    assert drive.publish_calls[0][1] == ["新照片.jpg"]
+
+
+def test_partial_batch_failure_retry_creates_no_duplicates():
+    """批量传了一半失败:重试补齐缺口,不产生重复文件。"""
+    row = snapshot()
+    row[fields.PROCESS_RECORD] = [
+        {"file_token": "t1", "name": "a.jpg"},
+        {"file_token": "t2", "name": "b.jpg"},
+        {"file_token": "t3", "name": "c.jpg"},
+    ]
+    bitable = FakeBitable("rec-1", row)
+    for token in ("t1", "t2", "t3"):
+        bitable.attachments[token] = token.encode()
+    repo = FakeGitRepository()
+
+    class HalfFailingDrive(FakeDrive):
+        def publish(self, folder_path, uploads):
+            # 第一次只传进去前两个就炸
+            if not self.uploaded:
+                self.publish_calls.append((tuple(folder_path), [u.name for u in uploads]))
+                leaf = folder_path[-1]
+                folder = self.uploaded.setdefault(leaf, {})
+                for item in uploads[:2]:
+                    folder[item.name] = item.content
+                raise RetryableError("传到第三个断了")
+            return super().publish(folder_path, uploads)
+
+    drive = HalfFailingDrive()
+    service = SubmissionService(bitable=bitable, repository=repo, drive=drive)
+
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+    assert repo.submit_calls == []
+
+    bitable.records["rec-1"][fields.REQUESTED] = True
+    service.process_record("rec-1", dict(bitable.records["rec-1"]))
+
+    leaf = drive.publish_calls[0][0][-1]
+    assert sorted(drive.uploaded[leaf]) == ["a.jpg", "b.jpg", "c.jpg"]
+    assert len(repo.submit_calls) == 1
+
+
+def test_round_folder_path_is_stable_for_a_whole_round():
+    """纯函数:同一行 + 同一提交时间 -> 整轮重试算出同一个目录。"""
+    stable = SubmissionService.round_folder_path("rec-1", 1770000000000, ["t1"])
+    assert stable == SubmissionService.round_folder_path("rec-1", 1770000000000, ["t1"])
+
+    # 有提交时间时目录名不看附件 —— 所以重试期间附件集合/顺序怎么变都落回原地,
+    # 这也正是「用户再点一次按钮 = Automation 重写提交时间 = 新的一次提交」的支点。
+    assert SubmissionService.round_folder_path("rec-1", 1770000000000, []) == stable
+    assert SubmissionService.round_folder_path("rec-1", 1770000000000, ["t9"]) == stable
+    # 换行 -> 换目录(同一次提交里的两行不撞)
+    assert SubmissionService.round_folder_path("rec-2", 1770000000000, ["t1"]) != stable
+
+
+def test_round_folder_path_layout():
+    month, leaf = SubmissionService.round_folder_path("recvuSWWkSJgOB", 1770000000000, [])
+    assert len(month) == 7 and month[4] == "-"
+    assert leaf.endswith("_recvuSWWkSJgOB")
+    assert leaf.startswith(month.replace("-", "")[:6])
+
+
+def test_round_folder_path_falls_back_to_digest_without_timestamp():
+    """缺提交时间 -> 内容摘要,**绝不用常量**(常量会让两轮共用一个目录)。"""
+    first = SubmissionService.round_folder_path("rec-1", None, ["t1"])
+    second = SubmissionService.round_folder_path("rec-1", None, ["t2"])
+
+    assert first[0] == "未分类"
+    assert first[1] != second[1]
+    assert first[1].endswith("_rec-1")
+    # 附件顺序不参与:同一批附件换个顺序必须还是同一个目录
+    assert SubmissionService.round_folder_path(
+        "rec-1", None, ["t2", "t1"]
+    )[1] == SubmissionService.round_folder_path("rec-1", None, ["t1", "t2"])[1]
+
+
+def test_round_folder_path_accepts_textual_submit_time():
+    """`date_text` 对文本原样返回,所以提交时间也可能是已格式化的字符串。"""
+    month, leaf = SubmissionService.round_folder_path("rec-1", "2026-09-11 10:23", [])
+
+    assert month == "2026-09"
+    assert leaf.startswith("20260911-1023")

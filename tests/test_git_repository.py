@@ -393,29 +393,23 @@ def test_gitea_create_branch_uses_gitea_endpoint(gitea_repo):
 # ----------------------------------------------------------------------
 # V3-P7/P8:commit message 与 PR 正文
 # ----------------------------------------------------------------------
-def test_commit_message_carries_identity_submitter_and_records():
+def test_commit_message_is_identity_and_submitter_only():
+    """commit message 是纯文本、不渲染 —— 过程记录不进这里(只进 PR 正文)。"""
     message = GitRepository.commit_message(
-        make_profile(),
-        DEFAULT_SUBMITTER,
-        DEFAULT_SUBMIT_TIME,
-        ["调参记录.md", "曲线.png"],
+        make_profile(), DEFAULT_SUBMITTER, DEFAULT_SUBMIT_TIME
     )
-    assert message.splitlines()[0] == "[材料] L1002@BBL P2S (BambuStudio)"
-    assert DEFAULT_SUBMITTER in message
-    assert DEFAULT_SUBMIT_TIME in message
-    assert "- 调参记录.md" in message and "- 曲线.png" in message
-
-
-def test_commit_message_without_records_omits_section():
-    message = GitRepository.commit_message(make_profile(), "张三", "2026-09-11")
+    assert message.splitlines() == [
+        "[材料] L1002@BBL P2S (BambuStudio)",
+        "",
+        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
+    ]
     assert "过程记录" not in message
-    assert message.splitlines()[0].startswith("[材料] L1002@BBL P2S")
 
 
-def test_submit_profile_writes_records_into_commit_message(
+def test_submit_profile_writes_records_only_into_pr_body(
     github_repo, github_server
 ):
-    """附件本体不进 Git:仓库里只有档案文件,记录名只出现在 commit message。"""
+    """附件本体既不进仓库也不进 commit message:只留文件名在 PR 正文。"""
     github_repo.submit_profile(
         make_profile(),
         submitter=DEFAULT_SUBMITTER,
@@ -426,7 +420,9 @@ def test_submit_profile_writes_records_into_commit_message(
     puts = [m for m in github_server.log if m[0] == "PUT"]
     message = puts[0][2]["message"]
     assert "[材料] L1002@BBL P2S (BambuStudio)" in message
-    assert "调参记录.md" in message
+    assert "调参记录.md" not in message
+
+    assert "- 调参记录.md" in _pull_request_body(github_server)
     # 仓库里没有多出任何附件文件
     assert set(github_server.files[DEFAULT_BRANCH]) == {REPO_PATH}
 
@@ -462,6 +458,97 @@ def test_pr_body_is_identity_then_diff_then_submitter(github_repo, github_server
     # 内部键名/身份重复信息不进正文(审查者看的是表格上的说法)
     assert "nozzle_temperature" not in "\n".join(lines)
     assert "PI Code" not in "\n".join(lines)
+
+
+def test_pr_body_carries_process_record_names(github_repo, github_server):
+    """过程记录(只列文件名)进 PR 正文 —— diff 下面、提交人/时间上面。
+
+    每轮一行一个 PR,记录跟着那一轮的正文走,逐轮对应由 PR 本身承载。
+    """
+    github_repo.submit_profile(
+        make_profile(),
+        submitter=DEFAULT_SUBMITTER,
+        submit_time=DEFAULT_SUBMIT_TIME,
+        process_records=["2026-09-10_温度塔.jpg", "2026-09-10_流量校准.jpg"],
+    )
+
+    body = _pull_request_body(github_server)
+    assert body.splitlines()[-5:] == [
+        "过程记录:",
+        "- 2026-09-10_温度塔.jpg",
+        "- 2026-09-10_流量校准.jpg",
+        "",
+        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
+    ]
+    # 附件本体不进仓库
+    assert set(github_server.files[DEFAULT_BRANCH]) == {REPO_PATH}
+
+
+def test_pr_body_omits_records_section_when_empty(github_repo, github_server):
+    github_repo.submit_profile(
+        make_profile(),
+        submitter=DEFAULT_SUBMITTER,
+        submit_time=DEFAULT_SUBMIT_TIME,
+    )
+    assert "过程记录" not in _pull_request_body(github_server)
+
+
+FOLDER_URL = "https://jfpolymers.feishu.cn/drive/folder/boxcnABCD"
+
+
+def test_pr_body_links_process_record_folder(github_repo, github_server):
+    """原件在云文档里 —— 文件名清单下面一行文件夹链接。"""
+    github_repo.submit_profile(
+        make_profile(),
+        submitter=DEFAULT_SUBMITTER,
+        submit_time=DEFAULT_SUBMIT_TIME,
+        process_records=["温度塔.jpg", "流量校准.jpg"],
+        process_records_folder_url=FOLDER_URL,
+    )
+
+    assert _pull_request_body(github_server).splitlines()[-6:] == [
+        "过程记录:",
+        "- 温度塔.jpg",
+        "- 流量校准.jpg",
+        f"文件夹: {FOLDER_URL}",
+        "",
+        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
+    ]
+
+
+def test_pr_body_omits_folder_line_without_url(github_repo, github_server):
+    """上传关闭时退回 V3-P8:只有文件名,不出现「文件夹:」空行。"""
+    github_repo.submit_profile(
+        make_profile(),
+        submitter=DEFAULT_SUBMITTER,
+        submit_time=DEFAULT_SUBMIT_TIME,
+        process_records=["温度塔.jpg"],
+    )
+
+    body = _pull_request_body(github_server)
+    assert "- 温度塔.jpg" in body
+    assert "文件夹:" not in body
+
+
+def test_pr_body_escapes_markdown_in_record_names(github_repo, github_server):
+    """文件名是人填的:换行与方括号不能改变正文结构。"""
+    github_repo.submit_profile(
+        make_profile(),
+        submitter=DEFAULT_SUBMITTER,
+        submit_time=DEFAULT_SUBMIT_TIME,
+        process_records=["正常.jpg", "恶意]\n\n伪造段落.jpg"],
+    )
+
+    lines = _pull_request_body(github_server).splitlines()
+    assert lines[-5:] == [
+        "过程记录:",
+        "- 正常.jpg",
+        # 换行收敛成空格、`]` 被转义 —— 两条记录就是两行,没有多出空行
+        "- 恶意\\] 伪造段落.jpg",
+        "",
+        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
+    ]
+    assert sum(1 for line in lines if line.startswith("- ")) == 2
 
 
 def test_pr_body_shows_field_diff_against_default_branch(

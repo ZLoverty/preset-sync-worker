@@ -38,6 +38,19 @@ class PullRequestResult:
     pull_request_url: str
 
 
+def _md_text(value: str) -> str:
+    """把用户提供的文本安全地放进 markdown 列表项。
+
+    文件名来自表格附件,是人填的:换行会把一行拆成两行(伪造出正文结构),
+    `[` `]` `\\` 会破坏链接语法。这里只做这两件事,不做完整转义 ——
+    目标是「不让文件名改变正文结构」,不是渲染出好看的 markdown。
+    """
+    text = re.sub(r"[\r\n]+", " ", str(value))
+    for char in ("\\", "[", "]"):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
 class _HttpError(Exception):
     """非预期 HTTP 状态(4xx 而非鉴权/限流),由上层按场景解释。"""
 
@@ -525,24 +538,19 @@ class GitRepository:
         profile: MaterialProfile,
         submitter: str,
         submit_time: str,
-        process_records: Sequence[str] = (),
     ) -> str:
-        """commit message:材料身份 + 提交人/时间 + 过程记录文件名(V3-P7/P8)。
+        """commit message:材料身份 + 提交人/时间(V3-P7)。
 
-        过程记录**附件本体不进 Git**,只留文件名 —— 每条改动与当时的
-        调参记录一一对应(用户确认的语义:提交成功后表里的过程记录被清空,
-        Git 历史是它唯一的留存处)。
+        **不含过程记录**(用户确认:commit message 是纯文本、不渲染,
+        不适合展示记录清单)—— 记录只在 PR 正文里,那里渲染 markdown。
         """
-        lines = [
-            f"[材料] {profile.identity} ({profile.slicer})",
-            "",
-            f"提交人: {submitter} · 提交时间: {submit_time}",
-        ]
-        if process_records:
-            lines.append("")
-            lines.append("过程记录:")
-            lines.extend(f"- {name}" for name in process_records)
-        return "\n".join(lines)
+        return "\n".join(
+            [
+                f"[材料] {profile.identity} ({profile.slicer})",
+                "",
+                f"提交人: {submitter} · 提交时间: {submit_time}",
+            ]
+        )
 
     @staticmethod
     def pull_request_body(
@@ -550,16 +558,29 @@ class GitRepository:
         before: Mapping[str, Any] | None,
         submitter: str,
         submit_time: str,
+        process_records: Sequence[str] = (),
+        process_records_folder_url: str = "",
     ) -> str:
-        """PR 正文:第一行身份,中间是「人话版」字段差异,最后提交人/时间。
+        """PR 正文:第一行身份,中间是「人话版」字段差异 + 过程记录,最后提交人/时间。
 
         `before` = 默认分支上该档案的现状(None = 首次提交)。正文只讲
         改了什么 —— 审查者据此就能判断这次调整合不合理,不必自己点开
         diff 逐键比对;字段标签用表格列名、数值带单位,不出现内部键名。
+
+        过程记录只列**文件名**,附件本体不进仓库:审查者要看的正是
+        「这次调参的依据」,放在 diff 旁边才对照得起来。文件名下面是
+        `process_records_folder_url`(原件在云文档里的位置)—— 这里只
+        当成一个不透明的链接字符串,**本模块不认识飞书**,也不拼 URL。
+
+        只写正文 —— commit message 是纯文本、不渲染,不适合摆记录清单;
+        而每轮一行一个 PR,同一 branch 上累积的多轮也各由那一轮的正文承载。
         """
         lines = [f"{profile.identity} · {profile.slicer}", ""]
         changes = describe_changes(before, profile.to_dict())
         lines.extend(changes or ["(与默认分支相比,基础数据无字段级变化)"])
+        if process_records:
+            if process_records_folder_url:
+                lines.extend(["", f"过程记录: {process_records_folder_url}"])
         lines.extend(["", f"提交人: {submitter} · 提交时间: {submit_time}"])
         return "\n".join(lines) + "\n"
 
@@ -570,6 +591,7 @@ class GitRepository:
         submitter: str = "(未记录)",
         submit_time: str = "(未记录)",
         process_records: Sequence[str] = (),
+        process_records_folder_url: str = "",
     ) -> PullRequestResult:
         """幂等地把一个行身份的基础数据落库并开 PR(V3-P5)。
 
@@ -600,9 +622,7 @@ class GitRepository:
 
         path = self.profile_path(profile)
         content = profile.to_json()
-        message = self.commit_message(
-            profile, submitter, submit_time, process_records
-        )
+        message = self.commit_message(profile, submitter, submit_time)
         self.commit(branch, message, path, content)
         self.push(branch)
 
@@ -630,6 +650,8 @@ class GitRepository:
             parse_profile_json(base_file["content"]) if base_file else None,
             submitter,
             submit_time,
+            process_records,
+            process_records_folder_url,
         )
         try:
             return self.create_pull_request(branch, title, body)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+import hashlib
+from datetime import datetime
+from typing import Any, Iterable, Sequence
 
 from material_worker import fields
-from material_worker.adapters.bitable import BitableClient
+from material_worker.adapters.bitable import AttachmentItem, BitableClient
 from material_worker.adapters.git import GitRepository
+from material_worker.adapters.lark_drive import DriveClient, DriveUpload
 from material_worker.domain.attachment_import import (
     SUPPORTED_EXTENSIONS,
     AttachmentFormatError,
@@ -39,6 +42,39 @@ JSON_ATTACHMENT_MAX_BYTES = 1_000_000
 # V2-P2:反写失败/解析失败写入「错误信息」的前缀,便于人工识别来源。
 JSON_PARSE_ERROR_PREFIX = "附件解析失败: "
 
+# V3-P10:「提交时间」取不出来时的月份层兜底目录名 —— 固定且显眼,
+# 一眼能看出这批记录的时间信息有问题。
+UNCLASSIFIED_MONTH = "未分类"
+
+
+def _compact_timestamp(value: object) -> str:
+    """「提交时间」原始值 -> 目录名可用的紧凑时间串;拿不到返回 ""。
+
+    表格里可能是毫秒时间戳(int),也可能是已经格式化好的文本(`date_text`
+    对文本原样返回,所以两种形态都得吃)。取不出来就交给调用方回退到内容
+    摘要 —— 这里绝不返回常量,常量会导致两轮提交共用一个目录。
+    """
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            moment = datetime.fromtimestamp(value / 1000).astimezone()
+        except (OverflowError, OSError, ValueError):
+            return ""
+        millis = moment.microsecond // 1000
+        return moment.strftime("%Y%m%d-%H%M%S") + f"-{millis:03d}"
+
+    digits = "".join(ch for ch in str(value) if ch.isdigit())[:14]
+    if len(digits) < 6:  # 连年月都凑不出来,当缺失
+        return ""
+    if len(digits) > 8:
+        return f"{digits[:8]}-{digits[8:]}"
+    return digits
+
+
+def _mb(size: int) -> str:
+    return f"{size / 1024 / 1024:.1f}MB"
+
 
 class SubmissionService:
     """业务编排层:输入校验 -> claim -> Git 幂等提交 -> 回写状态。
@@ -51,10 +87,13 @@ class SubmissionService:
         bitable: BitableClient,
         repository: GitRepository,
         max_retries: int = 5,
+        drive: DriveClient | None = None,
     ):
         self.bitable = bitable
         self.repository = repository
         self.max_retries = max_retries
+        # V3-P10:过程记录存档(未配置 -> None,退回「只列文件名」)
+        self.drive = drive
         # 无对应 PR 的「审核中」行只告警一次,避免每轮刷屏
         self._warned_no_pr: set[tuple[str, str]] = set()
         # V2-P2:同一 (record_id, file_token) 只解析一次 —— 确定性失败
@@ -512,6 +551,90 @@ class SubmissionService:
         return {**row_fields, **payload}
 
     # ------------------------------------------------------------------
+    # V3-P10:过程记录 -> 云文档
+    # ------------------------------------------------------------------
+    @staticmethod
+    def round_folder_path(
+        record_id: str,
+        submit_time_raw: object,
+        tokens: Sequence[str],
+    ) -> tuple[str, str]:
+        """本次提交的目标目录 (月份层, 叶子层) —— **整轮重试稳定**。
+
+        叶子层 = `{提交时间}_{record_id}`:时间戳给出「哪一次提交」,
+        `record_id` 给出「哪一行」。两者在整轮重试期间都不变,所以重试
+        必然落回同一个目录;用户再点一次按钮时 Automation 会重写提交
+        时间 -> 新目录 = 新的一次提交,正是要的语义。
+
+        月份层不是审美:飞书**单层节点上限 1500**,几千次提交平铺在根
+        目录下会直接超。
+
+        缺 `提交时间` 时(理论上走不到)回退成**内容摘要**,绝不用常量 ——
+        常量会让同一行两轮提交共用一个目录,第二轮的新照片被「按名跳过」
+        当成已存在,**静默丢失**,PR 反而链到上一轮的照片。
+        """
+        stamp = _compact_timestamp(submit_time_raw)
+        if stamp:
+            return f"{stamp[:4]}-{stamp[4:6]}", f"{stamp}_{record_id}"
+
+        digest = hashlib.sha1(
+            "|".join([record_id, *sorted(tokens)]).encode("utf-8")
+        ).hexdigest()[:12]
+        return UNCLASSIFIED_MONTH, f"{digest}_{record_id}"
+
+    def _publish_process_records(
+        self,
+        record_id: str,
+        submit_time_raw: object,
+        items: Sequence[AttachmentItem],
+    ) -> tuple[list[str], str]:
+        """把过程记录上传到云文档 -> (PR 正文用的文件名, 文件夹链接)。
+
+        - 未配置云文档 / 无附件 -> 只返回文件名,行为与 V3-P8 完全一致;
+        - 任一环节失败 -> 异常上抛,**本轮不建 PR**(证据优先于 PR)。
+
+        展示给 PR 正文的永远是**原始文件名**,不受落盘改名(重名后缀、
+        非法字符清洗)影响。
+        """
+        if self.drive is None or not items:
+            return [item.name for item in items], ""
+
+        uploads = [
+            DriveUpload(
+                name=item.name,
+                content=self._download_process_record(item, self.drive.max_file_bytes),
+            )
+            for item in items
+        ]
+        month, leaf = self.round_folder_path(
+            record_id, submit_time_raw, [item.file_token for item in items]
+        )
+        result = self.drive.publish((month, leaf), uploads)
+        return [item.name for item in items], result.folder_url
+
+    def _download_process_record(self, item: AttachmentItem, limit: int) -> bytes:
+        """下载一个过程记录附件,并在下载前后各做一次体积预检。
+
+        下载**前**用单元格里的 `size` 拦一道:media.download 会把整个
+        响应体缓冲进内存,等拿到 bytes 再判断,内存已经吃进去了 ——
+        所以预检必须在下载之前,这是唯一有效的防护。
+        """
+        if item.size is not None and item.size > limit:
+            raise PermanentError(
+                f"过程记录「{item.name}」{_mb(item.size)} 超过单文件上限 "
+                f"{_mb(limit)},请压缩后重新上传该附件"
+            )
+
+        content = self.bitable.download_attachment(item.file_token)
+        if len(content) > limit:
+            # 单元格没给 size(或给得不准)时的兜底
+            raise PermanentError(
+                f"过程记录「{item.name}」{_mb(len(content))} 超过单文件上限 "
+                f"{_mb(limit)},请压缩后重新上传该附件"
+            )
+        return content
+
+    # ------------------------------------------------------------------
     def process_record(
         self,
         record_id: str,
@@ -578,7 +701,17 @@ class SubmissionService:
 
             submitter = self.bitable.submitter_text(fields_snapshot)
             submit_time = self.bitable.submit_time_text(fields_snapshot)
-            process_records = self.bitable.process_record_names(fields_snapshot)
+            record_items = self.bitable.attachment_items(
+                fields_snapshot, fields.PROCESS_RECORD
+            )
+
+            # V3-P10:先把记录存档到云文档,**再**建 PR —— 上传失败就抛出去,
+            # 本轮不产生 PR(用户确认的语义:证据优先于 PR)。
+            process_records, folder_url = self._publish_process_records(
+                record_id,
+                fields_snapshot.get(fields.SUBMIT_TIME),
+                record_items,
+            )
 
             result = self.repository.submit_profile(
                 profile=profile,
@@ -588,14 +721,16 @@ class SubmissionService:
                 submitter=submitter,
                 submit_time=submit_time,
                 process_records=process_records,
+                process_records_folder_url=folder_url,
             )
             submission.mark_reviewing(result.pull_request_url)
 
-            # V3-P8:过程记录只在 commit message 里留存 -> PR 建立成功后清空该列
+            # V3-P8/P10:记录已在云文档留档 -> PR 建立成功后清空该列
+            # (判据是「这行有没有附件」,与上传有没有启用无关)
             self.bitable.mark_reviewing(
                 record_id,
                 result.pull_request_url,
-                clear_process_record=bool(process_records),
+                clear_process_record=bool(record_items),
             )
             self._retry_counts.pop(record_id, None)
             print(

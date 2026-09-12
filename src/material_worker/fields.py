@@ -45,7 +45,7 @@ VITRIFICATION = "玻璃化温度"
 INHERITS = "继承预设"
 PM_METHOD_VERSION = "调参方法版本"
 
-# V3-P2:过程记录(附件)—— worker 只取文件名写进 commit message,
+# V3-P2:过程记录(附件)—— worker 只取文件名写进 PR 正文,
 # 附件本体不进 Git;提交成功后清空该列(V3-P8)。
 PROCESS_RECORD = "过程记录"
 

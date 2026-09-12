@@ -97,19 +97,27 @@ def prusa_ini(**overrides) -> str:
     return "\n".join(lines) + "\n"
 
 
-def attachment_item(name: str, token: str = "tok-1"):
+def attachment_item(name: str, token: str = "tok-1", size: int | None = None):
     """Bitable 附件单元格项(适配层 AttachmentItem)。"""
     from material_worker.adapters.bitable import AttachmentItem
 
-    return AttachmentItem(file_token=token, name=name)
+    return AttachmentItem(file_token=token, name=name, size=size)
 
 
-def attachment_cell(*names: str) -> list[dict]:
-    """Bitable 附件列的原始单元格形态(list[{file_token, name}])。"""
-    return [
+def attachment_cell(*names: str, size: int | None = None) -> list[dict]:
+    """Bitable 附件列的原始单元格形态(list[{file_token, name}])。
+
+    默认不带 size(真实表格里该字段确实可能缺失);需要体积预检的用例
+    显式传 size。
+    """
+    cell = [
         {"file_token": f"tok-{i}", "name": name}
         for i, name in enumerate(names, start=1)
     ]
+    if size is not None:
+        for entry in cell:
+            entry["size"] = size
+    return cell
 
 
 __all__ = [

@@ -1,9 +1,9 @@
 """BitableClient 附件接口 —— 附件单元格归一化 + 媒体下载 + V3 两个附件列。
 
 用桩 lark client(不触网)驱动真实 BitableClient:
-- attachment_items:把附件列原始值(list[{file_token,name}])归一化,
-  空/缺列/异常形态返回空列表;V3 支持指定列(导入用 / 过程记录);
-- process_record_names:只取过程记录的文件名(附件本体不进 Git);
+- attachment_items:把附件列原始值(list[{file_token,name,size}])归一化,
+  空/缺列/异常形态返回空列表;V3 支持指定列(导入用 / 过程记录),
+  并读出声明的 size(V3-P10 体积预检的唯一依据);
 - submitter_text / submit_time_text:人员列 / 日期列 -> 展示文本;
 - download_attachment:调 drive.v1.media.download,二进制响应返回 bytes;
   失败码 -> BitableError、限流码/网络异常 -> RetryableError。
@@ -66,7 +66,7 @@ def make_bitable(client):
 # 附件单元格归一化
 # ----------------------------------------------------------------------
 def test_attachment_items_normalizes_cell():
-    """附件列原始值(list[{file_token,name}])归一化为 AttachmentItem。"""
+    """附件列原始值(list[{file_token,name,size}])归一化为 AttachmentItem。"""
     client, _ = make_client()
     bitable = make_bitable(client)
 
@@ -80,9 +80,27 @@ def test_attachment_items_normalizes_cell():
     )
 
     assert items == [
-        AttachmentItem(file_token="tok-1", name="profile.json"),
-        AttachmentItem(file_token="tok-2", name="photo.png"),
+        AttachmentItem(file_token="tok-1", name="profile.json", size=42),
+        AttachmentItem(file_token="tok-2", name="photo.png", size=None),
     ]
+
+
+def test_attachment_items_ignores_non_int_size():
+    """size 形态异常(字符串/浮点)一律当缺失 —— 体积预检不能因此误判。"""
+    client, _ = make_client()
+    bitable = make_bitable(client)
+
+    items = bitable.attachment_items(
+        {
+            fields.PROFILE_JSON: [
+                {"file_token": "tok-1", "name": "a.json", "size": "42"},
+                {"file_token": "tok-2", "name": "b.json", "size": 4.2},
+                {"file_token": "tok-3", "name": "c.json", "size": True},
+            ]
+        }
+    )
+
+    assert [i.size for i in items] == [None, None, None]
 
 
 def test_attachment_items_reads_requested_column():
@@ -112,19 +130,6 @@ def test_attachment_items_returns_empty_for_absent_or_malformed_cell():
     assert bitable.attachment_items(
         {fields.PROFILE_JSON: [{"file_token": "t"}, {"name": "x"}, "junk"]}
     ) == []
-
-
-def test_process_record_names_only_returns_file_names():
-    """V3-P8:过程记录只取文件名 —— 附件本体不进 Git,只进 commit message。"""
-    client, _ = make_client()
-    bitable = make_bitable(client)
-    row = {
-        fields.PROCESS_RECORD: attachment_cell("调参记录.md", "曲线.png"),
-        fields.PROFILE_JSON: attachment_cell("profile.json"),
-    }
-
-    assert bitable.process_record_names(row) == ["调参记录.md", "曲线.png"]
-    assert bitable.process_record_names({}) == []
 
 
 # ----------------------------------------------------------------------
