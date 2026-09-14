@@ -1,30 +1,21 @@
-from datetime import datetime
+"""MaterialSubmission 领域对象 + V3-P5 的 branch 派生规则。
 
+V3:表里不再有「提交 ID」列(resolve_submission_id 已删除)——
+一行 = 一个身份,每次提交都提交这一行,提交 ID 会被覆盖而失去意义,
+幂等改由「branch 由身份派生」承担。本轮提交也不再生成任何 id 或
+时间戳(用户确认:提交的文件里 submission/generated_at 没用)。
+"""
 import pytest
 
-from material_worker import fields
-from material_worker.domain.profile import MaterialProfile
+from helpers import make_profile as make_valid_profile
+
+from material_worker.adapters.git import GitRepository
 from material_worker.domain.status import InvalidTransitionError, SubmissionStatus
-from material_worker.domain.submission import (
-    MaterialSubmission,
-    resolve_submission_id,
-)
+from material_worker.domain.submission import MaterialSubmission
 
 
 def make_submission():
-    profile = MaterialProfile(
-        id="test",
-        name="Test PLA",
-        nozzle_temperature=220,
-        max_volumetric_speed=20,
-    )
-
-    return MaterialSubmission(
-        submission_id="submission-1",
-        record_id="rec-1",
-        profile=profile,
-        submitted_at=datetime.now(),
-    )
+    return MaterialSubmission(record_id="rec-1", profile=make_valid_profile())
 
 
 def test_submission_state():
@@ -59,44 +50,39 @@ def test_illegal_transition_raises():
         submission.mark_processing()  # 审核中 -> 处理中 非法
 
 
-def _snapshot(status, submission_id=None, **extra):
-    data = {
-        fields.NAME: "Test PLA",
-        fields.NOZZLE_TEMP: 220,
-        fields.MAX_VOL_SPEED: 20,
-        fields.STATUS: status.value if status else None,
-    }
-    if submission_id is not None:
-        data[fields.SUBMISSION_ID] = submission_id
-    data.update(extra)
-    return data
+def test_submission_carries_no_traceability_fields():
+    """没有 submission_id / submitted_at —— 溯源交给 Git 历史。"""
+    submission = make_submission()
+    assert not hasattr(submission, "submission_id")
+    assert not hasattr(submission, "submitted_at")
 
 
-def test_resolve_generates_id_on_blank_record():
-    sid = resolve_submission_id(_snapshot(SubmissionStatus.PENDING))
-    assert sid
+# ----------------------------------------------------------------------
+# V3-P5:branch 由行身份派生
+# ----------------------------------------------------------------------
+def test_branch_name_derived_from_identity_and_slicer():
+    assert GitRepository.branch_name_for("L1002@BBL P2S", "BambuStudio") == (
+        "material/L1002@BBL_P2S_BambuStudio"
+    )
 
 
-def test_resolve_reuses_id_for_pending_processing_failed():
-    for status in (
-        SubmissionStatus.PENDING,
-        SubmissionStatus.PROCESSING,
-        SubmissionStatus.FAILED,
-    ):
-        sid = resolve_submission_id(_snapshot(status, submission_id="sub-keep"))
-        assert sid == "sub-keep"
+def test_branch_name_is_stable_for_same_identity():
+    """同一行永远同一 branch —— 重复点击/重试天然幂等的基础。"""
+    first = GitRepository.branch_name_for("L1002@BBL P2S", "BambuStudio")
+    second = GitRepository.branch_name_for("L1002@BBL P2S", "BambuStudio")
+    assert first == second
 
 
-def test_resolve_generates_new_id_after_terminal_state():
-    for status in (
-        SubmissionStatus.REVIEWING,
-        SubmissionStatus.APPROVED,
-        SubmissionStatus.REJECTED,
-    ):
-        sid = resolve_submission_id(_snapshot(status, submission_id="sub-old"))
-        assert sid != "sub-old"
+def test_branch_differs_across_slicers():
+    bambu = GitRepository.branch_name_for("L1002@BBL P2S", "BambuStudio")
+    prusa = GitRepository.branch_name_for("L1002@BBL P2S", "PrusaSlicer")
+    assert bambu != prusa
 
 
-def test_resolve_generates_id_when_terminal_without_id():
-    sid = resolve_submission_id(_snapshot(SubmissionStatus.APPROVED))
-    assert sid
+def test_branch_has_no_spaces():
+    """git branch 名不能含空格 -> 空白折叠为下划线。"""
+    branch = GitRepository.branch_name_for(
+        "L1002@Creality K2 Pro", "CrealityPrint"
+    )
+    assert " " not in branch
+    assert branch == "material/L1002@Creality_K2_Pro_CrealityPrint"

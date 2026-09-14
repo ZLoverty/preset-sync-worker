@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from dataclasses import dataclass
 
-from material_worker import fields
 from material_worker.domain.profile import MaterialProfile
 from material_worker.domain.status import SubmissionStatus
 
@@ -14,20 +10,23 @@ from material_worker.domain.status import SubmissionStatus
 class MaterialSubmission:
     """一次「提交」操作的领域对象(每次处理尝试会重建一个新实例)。
 
-    注意:处理失败后的自动重试/用户重按按钮,会复用同一
-    ``submission_id``(branch 因此确定不变),但每次尝试都会新建本对象,
-    初始状态恒为 PENDING —— 表格行的真实状态以 Bitable 为准。
+    V3-P5:表格里**没有**「提交 ID」列 —— 一行 = 一个身份,每次提交都提交
+    这一行,提交 ID 会被覆盖而失去意义(用户确认)。因此:
+
+    - branch 由**行身份**确定(`<PI Code>@<打印机型号>` × 切片软件),
+      同一行永远同一 branch,重复点击/自动重试天然幂等;
+    - 本轮提交**不产生任何 id 或时间戳**:文件、PR 正文、commit message
+      都只讲「谁在什么时候改了什么」,内部 uuid 一概不写(用户确认:
+      提交的文件里 submission/generated_at 没用);
+    - 重试计数只存在于 worker 进程内(service 的内存表),重启清零。
     """
 
-    submission_id: str
     record_id: str
     profile: MaterialProfile
-    submitted_at: datetime
 
     status: SubmissionStatus = SubmissionStatus.PENDING
-    retry_count: int = 0
 
-    branch_name: str | None = field(default=None)
+    branch_name: str | None = None
     pull_request_url: str | None = None
     error_message: str | None = None
 
@@ -46,27 +45,3 @@ class MaterialSubmission:
     def mark_failed(self, message: str) -> None:
         self._transition_to(SubmissionStatus.FAILED)
         self.error_message = message
-
-
-def new_submission_id() -> str:
-    return uuid.uuid4().hex
-
-
-def resolve_submission_id(current_fields: dict[str, Any]) -> str:
-    """决定本次点击复用还是新开一个提交 ID(P3 #18 / 已确认的业务语义)。
-
-    规则(按行当前状态区分):
-    - 已有提交 ID 且行处于 待处理/处理中/失败(同一次提交的重试)
-      -> 复用该 ID(保证重试不会产生第二个 branch/PR);
-    - 行处于 审核中/已通过/已拒绝(上一轮提交已收尾)或无提交 ID
-      -> 生成新 ID,开启新一轮提交。
-    """
-    status = SubmissionStatus.from_table(current_fields.get(fields.STATUS))
-    existing = current_fields.get(fields.SUBMISSION_ID)
-
-    if existing is not None and str(existing).strip() != "":
-        if status.retry_reuses_same_submission():
-            return str(existing).strip()
-        # 行属于上一轮已收尾的提交:即使带旧 ID 也开新一轮。
-
-    return new_submission_id()
