@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from material_worker import fields as mw_fields
+from preset_sync_worker import fields as psw_fields
 
 
 class ProfileValidationError(ValueError):
@@ -90,27 +90,27 @@ class ProfileField:
 FIELD_SCHEMA: tuple[ProfileField, ...] = (
     # —— 身份三要素 + 调参方法版本:均为单选列,只能人工在下拉中选择 ——
     # key 与列名同形,仅用于内部寻址(附件不反写、也不作为输出键)。
-    ProfileField("pi_code", mw_fields.PI_CODE, True, False, backfill=False),
-    ProfileField("printer_model", mw_fields.PRINTER_MODEL, True, False, backfill=False),
-    ProfileField("slicer", mw_fields.SLICER, True, False, backfill=False),
-    ProfileField("pm_method_version", mw_fields.PM_METHOD_VERSION, True, False,
+    ProfileField("pi_code", psw_fields.PI_CODE, True, False, backfill=False),
+    ProfileField("printer_model", psw_fields.PRINTER_MODEL, True, False, backfill=False),
+    ProfileField("slicer", psw_fields.SLICER, True, False, backfill=False),
+    ProfileField("pm_method_version", psw_fields.PM_METHOD_VERSION, True, False,
                  backfill=False),
     # —— 结构参数:继承预设(V3 升为必填)——
-    ProfileField("inherits", mw_fields.INHERITS, True, False),
+    ProfileField("inherits", psw_fields.INHERITS, True, False),
     # —— 核心参数(必填)——
-    ProfileField("textured_plate_temp", mw_fields.BED_TEMP, True, True),
-    ProfileField("nozzle_temperature", mw_fields.NOZZLE_TEMP, True, True),
-    ProfileField("fan_cooling_layer_time", mw_fields.FAN_COOLING_LAYER_TIME, True, True),
-    ProfileField("fan_max_speed", mw_fields.FAN_MAX_SPEED, True, True),
-    ProfileField("fan_min_speed", mw_fields.FAN_MIN_SPEED, True, True),
-    ProfileField("slow_down_layer_time", mw_fields.SLOW_DOWN_LAYER_TIME, True, True),
-    ProfileField("filament_flow_ratio", mw_fields.FLOW_RATIO, True, True),
-    ProfileField("filament_max_volumetric_speed", mw_fields.MAX_VOL_SPEED, True, True),
+    ProfileField("textured_plate_temp", psw_fields.BED_TEMP, True, True),
+    ProfileField("nozzle_temperature", psw_fields.NOZZLE_TEMP, True, True),
+    ProfileField("fan_cooling_layer_time", psw_fields.FAN_COOLING_LAYER_TIME, True, True),
+    ProfileField("fan_max_speed", psw_fields.FAN_MAX_SPEED, True, True),
+    ProfileField("fan_min_speed", psw_fields.FAN_MIN_SPEED, True, True),
+    ProfileField("slow_down_layer_time", psw_fields.SLOW_DOWN_LAYER_TIME, True, True),
+    ProfileField("filament_flow_ratio", psw_fields.FLOW_RATIO, True, True),
+    ProfileField("filament_max_volumetric_speed", psw_fields.MAX_VOL_SPEED, True, True),
     # —— 可选参数(为空 -> 输出省略该键,由 inherits 继承父配置)——
-    ProfileField("filament_density", mw_fields.FILAMENT_DENSITY, False, True),
-    ProfileField("temperature_vitrification", mw_fields.VITRIFICATION, False, True),
-    ProfileField("filament_retraction_length", mw_fields.RETRACTION_LENGTH, False, True),
-    ProfileField("pressure_advance", mw_fields.PRESSURE_ADVANCE, False, True),
+    ProfileField("filament_density", psw_fields.FILAMENT_DENSITY, False, True),
+    ProfileField("temperature_vitrification", psw_fields.VITRIFICATION, False, True),
+    ProfileField("filament_retraction_length", psw_fields.RETRACTION_LENGTH, False, True),
+    ProfileField("pressure_advance", psw_fields.PRESSURE_ADVANCE, False, True),
 )
 
 REQUIRED_FIELDS: tuple[ProfileField, ...] = tuple(
@@ -221,10 +221,10 @@ class MaterialProfile:
         这里再做一次防御(直接构造未校验对象时也不至于写出越界路径)。
         """
         for label, segment in (
-            (mw_fields.PI_CODE, self.pi_code),
+            (psw_fields.PI_CODE, self.pi_code),
             ("品牌", self.brand),
             ("机型", self.model),
-            (mw_fields.SLICER, self.slicer),
+            (psw_fields.SLICER, self.slicer),
         ):
             if not segment or any(c in _FORBIDDEN_PATH_CHARS for c in segment):
                 raise ProfileValidationError(
@@ -256,7 +256,7 @@ class MaterialProfile:
         if missing:
             raise ProfileValidationError(
                 "缺少必填字段: " + "、".join(missing)
-                + f"(可补填单元格,或在「{mw_fields.PROFILE_JSON}」列挂附件导入)"
+                + f"(可补填单元格,或在「{psw_fields.PROFILE_JSON}」列挂附件导入)"
             )
 
         values: dict[str, Any] = {}
@@ -280,14 +280,14 @@ class MaterialProfile:
 
         if not self.model:
             raise ProfileValidationError(
-                f"「{mw_fields.PRINTER_MODEL}」需为「品牌 机型」形式"
+                f"「{psw_fields.PRINTER_MODEL}」需为「品牌 机型」形式"
                 f"(如 BBL P2S / Prusa Core One): {self.printer_model!r}"
             )
         for label, segment in (
-            (mw_fields.PI_CODE, self.pi_code),
+            (psw_fields.PI_CODE, self.pi_code),
             ("品牌", self.brand),
             ("机型", self.model),
-            (mw_fields.SLICER, self.slicer),
+            (psw_fields.SLICER, self.slicer),
         ):
             if any(c in _FORBIDDEN_PATH_CHARS for c in segment):
                 raise ProfileValidationError(

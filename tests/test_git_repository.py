@@ -23,17 +23,15 @@ from helpers import (
     make_profile as make_valid_profile,
 )
 
-from material_worker import fields
-from material_worker.adapters.git import GitRepository, PullRequestResult
-from material_worker.exceptions import PermanentError, RetryableError
+from preset_sync_worker import fields
+from preset_sync_worker.adapters.git import GitRepository, PullRequestResult
+from preset_sync_worker.exceptions import PermanentError, RetryableError
 
 # V3-P4:默认档案(L1002 / BBL P2S / BambuStudio)的仓库内路径
 REPO_PATH = DEFAULT_REPO_PATH
 
-
 def make_profile():
     return make_valid_profile()
-
 
 class _Response:
     def __init__(self, payload: bytes):
@@ -47,7 +45,6 @@ class _Response:
 
     def __exit__(self, *args):
         return False
-
 
 class FakeGitServer:
     """内存 Git 服务端:GitHub / Gitea 双形态,branch/contents/pulls 基本语义。
@@ -248,15 +245,12 @@ class FakeGitServer:
         self.pulls.append(entry)
         return entry["html_url"]
 
-
 def _raise_http(url: str, code: int, fp: io.BytesIO):
     raise urllib.error.HTTPError(url, code, "http error", {}, fp)
-
 
 @pytest.fixture
 def github_server():
     return FakeGitServer("/repos/o/r")
-
 
 @pytest.fixture
 def github_repo(monkeypatch, github_server):
@@ -266,14 +260,12 @@ def github_repo(monkeypatch, github_server):
     )
     return repo
 
-
 @pytest.fixture
 def gitea_repo(monkeypatch):
     server = FakeGitServer("/api/v1/repos/o/r")
     repo = GitRepository("https://git.example.com/o/r.git", "tok")
     monkeypatch.setattr("urllib.request.urlopen", server)
     return repo, server
-
 
 # ----------------------------------------------------------------------
 # 提交:branch 派生 + 幂等 + 空变更保护
@@ -297,7 +289,6 @@ def test_submit_profile_creates_pr(github_repo, github_server):
         assert key not in payload
     assert "id" not in payload and "filament_settings_id" not in payload
 
-
 def test_submit_profile_idempotent_no_duplicate_pr(github_repo, github_server):
     first = github_repo.submit_profile(make_profile())
     second = github_repo.submit_profile(make_profile())
@@ -309,7 +300,6 @@ def test_submit_profile_idempotent_no_duplicate_pr(github_repo, github_server):
     puts = [m for m in github_server.log if m[0] == "PUT"]
     assert len(puts) == 1
 
-
 def test_submit_profile_reuses_current_round_pr_url(github_repo, github_server):
     """上一轮 PR 仍在打开(回写失败后重试)-> 直接收敛到同一 PR。"""
     url = github_server.add_pull()
@@ -317,7 +307,6 @@ def test_submit_profile_reuses_current_round_pr_url(github_repo, github_server):
 
     assert result.pull_request_url == url
     assert len(github_server.pulls) == 1
-
 
 def test_submit_profile_opens_new_round_after_previous_pr_closed(
     github_repo, github_server
@@ -330,7 +319,6 @@ def test_submit_profile_opens_new_round_after_previous_pr_closed(
 
     assert result.pull_request_url != closed
     assert len(github_server.pulls) == 2
-
 
 def test_partial_success_recovers_without_duplicate_content_commit(
     github_repo, github_server
@@ -348,7 +336,6 @@ def test_partial_success_recovers_without_duplicate_content_commit(
     puts = [m for m in github_server.log if m[0] == "PUT"]
     assert len(puts) == 1  # 内容未变,重试不重复提交文件
 
-
 def test_no_changes_raises_permanent(github_repo, github_server):
     """内容与默认分支一致(例如已合并后无改动再次提交)-> 不建空 PR。"""
     profile = make_profile()
@@ -358,18 +345,15 @@ def test_no_changes_raises_permanent(github_repo, github_server):
         github_repo.submit_profile(profile)
     assert github_server.pulls == []
 
-
 def test_auth_error_is_permanent(github_repo, github_server):
     github_server.force_status = 401
     with pytest.raises(PermanentError):
         github_repo.submit_profile(make_profile())
 
-
 def test_transient_5xx_is_retryable(github_repo, github_server):
     github_server.force_status = 503
     with pytest.raises(RetryableError):
         github_repo.submit_profile(make_profile())
-
 
 def test_gitea_create_branch_uses_gitea_endpoint(gitea_repo):
     repo, server = gitea_repo
@@ -389,7 +373,6 @@ def test_gitea_create_branch_uses_gitea_endpoint(gitea_repo):
     # Gitea 的 branch commit 只带 id 字段(/api/v1 前缀),仍能读到 head
     assert server.heads[DEFAULT_BRANCH] != "c-main"
 
-
 # ----------------------------------------------------------------------
 # V3-P7/P8:commit message 与 PR 正文
 # ----------------------------------------------------------------------
@@ -405,33 +388,10 @@ def test_commit_message_is_identity_and_submitter_only():
     ]
     assert "过程记录" not in message
 
-
-def test_submit_profile_writes_records_only_into_pr_body(
-    github_repo, github_server
-):
-    """附件本体既不进仓库也不进 commit message:只留文件名在 PR 正文。"""
-    github_repo.submit_profile(
-        make_profile(),
-        submitter=DEFAULT_SUBMITTER,
-        submit_time=DEFAULT_SUBMIT_TIME,
-        process_records=["调参记录.md"],
-    )
-
-    puts = [m for m in github_server.log if m[0] == "PUT"]
-    message = puts[0][2]["message"]
-    assert "[材料] L1002@BBL P2S (BambuStudio)" in message
-    assert "调参记录.md" not in message
-
-    assert "- 调参记录.md" in _pull_request_body(github_server)
-    # 仓库里没有多出任何附件文件
-    assert set(github_server.files[DEFAULT_BRANCH]) == {REPO_PATH}
-
-
 def _pull_request_body(github_server) -> str:
     posts = [m for m in github_server.log if m[0] == "POST" and m[1].endswith("/pulls")]
     assert len(posts) == 1
     return posts[0][2]["body"]
-
 
 def test_pr_body_is_identity_then_diff_then_submitter(github_repo, github_server):
     """PR 正文 = 首行身份 + 人话版字段差异 + 提交人/时间(用户确认的形态)。"""
@@ -459,31 +419,6 @@ def test_pr_body_is_identity_then_diff_then_submitter(github_repo, github_server
     assert "nozzle_temperature" not in "\n".join(lines)
     assert "PI Code" not in "\n".join(lines)
 
-
-def test_pr_body_carries_process_record_names(github_repo, github_server):
-    """过程记录(只列文件名)进 PR 正文 —— diff 下面、提交人/时间上面。
-
-    每轮一行一个 PR,记录跟着那一轮的正文走,逐轮对应由 PR 本身承载。
-    """
-    github_repo.submit_profile(
-        make_profile(),
-        submitter=DEFAULT_SUBMITTER,
-        submit_time=DEFAULT_SUBMIT_TIME,
-        process_records=["2026-09-10_温度塔.jpg", "2026-09-10_流量校准.jpg"],
-    )
-
-    body = _pull_request_body(github_server)
-    assert body.splitlines()[-5:] == [
-        "过程记录:",
-        "- 2026-09-10_温度塔.jpg",
-        "- 2026-09-10_流量校准.jpg",
-        "",
-        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
-    ]
-    # 附件本体不进仓库
-    assert set(github_server.files[DEFAULT_BRANCH]) == {REPO_PATH}
-
-
 def test_pr_body_omits_records_section_when_empty(github_repo, github_server):
     github_repo.submit_profile(
         make_profile(),
@@ -491,65 +426,6 @@ def test_pr_body_omits_records_section_when_empty(github_repo, github_server):
         submit_time=DEFAULT_SUBMIT_TIME,
     )
     assert "过程记录" not in _pull_request_body(github_server)
-
-
-FOLDER_URL = "https://jfpolymers.feishu.cn/drive/folder/boxcnABCD"
-
-
-def test_pr_body_links_process_record_folder(github_repo, github_server):
-    """原件在云文档里 —— 文件名清单下面一行文件夹链接。"""
-    github_repo.submit_profile(
-        make_profile(),
-        submitter=DEFAULT_SUBMITTER,
-        submit_time=DEFAULT_SUBMIT_TIME,
-        process_records=["温度塔.jpg", "流量校准.jpg"],
-        process_records_folder_url=FOLDER_URL,
-    )
-
-    assert _pull_request_body(github_server).splitlines()[-6:] == [
-        "过程记录:",
-        "- 温度塔.jpg",
-        "- 流量校准.jpg",
-        f"文件夹: {FOLDER_URL}",
-        "",
-        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
-    ]
-
-
-def test_pr_body_omits_folder_line_without_url(github_repo, github_server):
-    """上传关闭时退回 V3-P8:只有文件名,不出现「文件夹:」空行。"""
-    github_repo.submit_profile(
-        make_profile(),
-        submitter=DEFAULT_SUBMITTER,
-        submit_time=DEFAULT_SUBMIT_TIME,
-        process_records=["温度塔.jpg"],
-    )
-
-    body = _pull_request_body(github_server)
-    assert "- 温度塔.jpg" in body
-    assert "文件夹:" not in body
-
-
-def test_pr_body_escapes_markdown_in_record_names(github_repo, github_server):
-    """文件名是人填的:换行与方括号不能改变正文结构。"""
-    github_repo.submit_profile(
-        make_profile(),
-        submitter=DEFAULT_SUBMITTER,
-        submit_time=DEFAULT_SUBMIT_TIME,
-        process_records=["正常.jpg", "恶意]\n\n伪造段落.jpg"],
-    )
-
-    lines = _pull_request_body(github_server).splitlines()
-    assert lines[-5:] == [
-        "过程记录:",
-        "- 正常.jpg",
-        # 换行收敛成空格、`]` 被转义 —— 两条记录就是两行,没有多出空行
-        "- 恶意\\] 伪造段落.jpg",
-        "",
-        f"提交人: {DEFAULT_SUBMITTER} · 提交时间: {DEFAULT_SUBMIT_TIME}",
-    ]
-    assert sum(1 for line in lines if line.startswith("- ")) == 2
-
 
 def test_pr_body_shows_field_diff_against_default_branch(
     github_repo, github_server
@@ -566,7 +442,6 @@ def test_pr_body_shows_field_diff_against_default_branch(
     assert f"{fields.FLOW_RATIO}: 0.95 → 0.92" in body
     assert fields.MAX_VOL_SPEED not in body  # 没动的字段不啰嗦
 
-
 # ----------------------------------------------------------------------
 # 审查同步:按 PR URL 反查(表里已无提交 ID)
 # ----------------------------------------------------------------------
@@ -577,28 +452,23 @@ def test_pull_number_parses_both_providers():
     assert GitRepository.pull_number("") is None
     assert GitRepository.pull_number("https://g.example/o/r/pulls") is None
 
-
 def test_pr_state_open(github_repo, github_server):
     url = github_server.add_pull(state="open")
     assert github_repo.pr_state(url) == "open"
-
 
 def test_pr_state_merged(github_repo, github_server):
     # 已合并的 PR:state=closed + merged=true(须判为 merged 而非 closed)
     url = github_server.add_pull(state="closed", merged=True)
     assert github_repo.pr_state(url) == "merged"
 
-
 def test_pr_state_closed_unmerged(github_repo, github_server):
     url = github_server.add_pull(state="closed")
     assert github_repo.pr_state(url) == "closed"
-
 
 def test_pr_state_none_for_empty_or_unknown_url(github_repo, github_server):
     assert github_repo.pr_state("") is None
     assert github_repo.pr_state("https://host.example/o/r/pull/999") is None
     assert github_repo.pr_state("not-a-url") is None
-
 
 def test_pr_state_keyed_by_url_not_branch(github_repo, github_server):
     """同一 branch 上多轮 PR:按 URL 认,不会被别的轮次串扰。"""
@@ -608,7 +478,6 @@ def test_pr_state_keyed_by_url_not_branch(github_repo, github_server):
     assert github_repo.pr_state(first) == "merged"
     assert github_repo.pr_state(second) == "open"
 
-
 def test_find_open_pr_for_branch_ignores_closed(github_repo, github_server):
     github_server.add_pull(state="closed", merged=True)
     assert github_repo.find_open_pr_for_branch(DEFAULT_BRANCH) is None
@@ -617,11 +486,9 @@ def test_find_open_pr_for_branch_ignores_closed(github_repo, github_server):
     found = github_repo.find_open_pr_for_branch(DEFAULT_BRANCH)
     assert found is not None and found.pull_request_url == url
 
-
 def test_find_open_pr_for_branch_ignores_other_branches(github_repo, github_server):
     github_server.add_pull(branch="material/other", state="open")
     assert github_repo.find_open_pr_for_branch(DEFAULT_BRANCH) is None
-
 
 # ----------------------------------------------------------------------
 # V2-P3:pr_close_reason(关闭理由 = 关闭前最后一条非空普通评论)
@@ -636,7 +503,6 @@ def test_pr_close_reason_last_comment_before_close(github_repo, github_server):
     ]
     assert github_repo.pr_close_reason(url) == "需要补充测试数据"
 
-
 def test_pr_close_reason_skips_empty_body_and_comments_after_close(
     github_repo, github_server
 ):
@@ -649,7 +515,6 @@ def test_pr_close_reason_skips_empty_body_and_comments_after_close(
         {"created_at": "2026-09-01T11:00:00Z", "body": "缺材料 ID"},
     ]
     assert github_repo.pr_close_reason(url) == "缺材料 ID"
-
 
 def test_pr_close_reason_compares_absolute_time_across_timezones(
     github_repo, github_server
@@ -665,18 +530,15 @@ def test_pr_close_reason_compares_absolute_time_across_timezones(
     ]
     assert github_repo.pr_close_reason(url) == "时区偏移的评论"
 
-
 def test_pr_close_reason_none_when_no_comments(github_repo, github_server):
     url = github_server.add_pull(
         state="closed", closed_at="2026-09-02T08:00:00Z"
     )
     assert github_repo.pr_close_reason(url) is None
 
-
 def test_pr_close_reason_none_for_open_pr(github_repo, github_server):
     url = github_server.add_pull(state="open")
     assert github_repo.pr_close_reason(url) is None
-
 
 def test_pr_close_reason_none_for_merged_pr(github_repo, github_server):
     # 已合并(merged=true)不是关闭未合并:不写理由
@@ -688,10 +550,8 @@ def test_pr_close_reason_none_for_merged_pr(github_repo, github_server):
     ]
     assert github_repo.pr_close_reason(url) is None
 
-
 def test_pr_close_reason_none_for_empty_url(github_repo, github_server):
     assert github_repo.pr_close_reason("") is None
-
 
 # ----------------------------------------------------------------------
 # URL / 路径
@@ -699,12 +559,10 @@ def test_pr_close_reason_none_for_empty_url(github_repo, github_server):
 def test_profile_path_uses_v3_layout(github_repo):
     assert github_repo.profile_path(make_profile()) == REPO_PATH
 
-
 def test_branch_name_comes_from_identity(github_repo):
     assert github_repo.branch_name_for("L1002@BBL P2S", "BambuStudio") == (
         DEFAULT_BRANCH
     )
-
 
 def test_repository_url_parsing():
     gh = GitRepository("https://github.com/o/r.git", "t")

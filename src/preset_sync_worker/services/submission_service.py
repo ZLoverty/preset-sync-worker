@@ -4,27 +4,27 @@ import hashlib
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
-from material_worker import fields
-from material_worker.adapters.bitable import AttachmentItem, BitableClient
-from material_worker.adapters.git import GitRepository
-from material_worker.adapters.lark_drive import DriveClient, DriveUpload
-from material_worker.domain.attachment_import import (
+from preset_sync_worker import fields
+from preset_sync_worker.adapters.bitable import AttachmentItem, BitableClient
+from preset_sync_worker.adapters.git import GitRepository
+from preset_sync_worker.adapters.lark_drive import DriveClient, DriveUpload
+from preset_sync_worker.domain.attachment_import import (
     SUPPORTED_EXTENSIONS,
     AttachmentFormatError,
     extract_attachment_values,
 )
-from material_worker.domain.profile import (
+from preset_sync_worker.domain.profile import (
     FIELD_SCHEMA,
     MaterialProfile,
     ProfileValidationError,
 )
-from material_worker.domain.status import SubmissionStatus
-from material_worker.domain.submission import MaterialSubmission
-from material_worker.exceptions import (
+from preset_sync_worker.domain.status import SubmissionStatus
+from preset_sync_worker.domain.submission import MaterialSubmission
+from preset_sync_worker.exceptions import (
     PermanentError,
     RetryableError,
 )
-from material_worker.logging_setup import log
+from preset_sync_worker.logging_setup import log
 
 # V2-P3:PR 被关闭(未合并)但 Git 侧无任何评论可作关闭理由时的兜底文案。
 CLOSE_REASON_FALLBACK = "PR 已关闭,未说明原因"

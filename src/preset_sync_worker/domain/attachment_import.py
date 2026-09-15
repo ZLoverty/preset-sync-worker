@@ -19,8 +19,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from material_worker.domain import slicer_import
-from material_worker.domain.profile import (
+from preset_sync_worker.domain import slicer_import
+from preset_sync_worker.domain.profile import (
     FIELD_SCHEMA,
     coerce_attachment_number,
     is_nil_token,

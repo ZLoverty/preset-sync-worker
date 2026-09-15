@@ -6,8 +6,8 @@
 
 import json
 
-from material_worker import fields
-from material_worker.domain.profile import FIELD_SCHEMA, MaterialProfile
+from preset_sync_worker import fields
+from preset_sync_worker.domain.profile import FIELD_SCHEMA, MaterialProfile
 
 DEFAULTS = {
     "pi_code": "L1002",
@@ -99,7 +99,7 @@ def prusa_ini(**overrides) -> str:
 
 def attachment_item(name: str, token: str = "tok-1", size: int | None = None):
     """Bitable 附件单元格项(适配层 AttachmentItem)。"""
-    from material_worker.adapters.bitable import AttachmentItem
+    from preset_sync_worker.adapters.bitable import AttachmentItem
 
     return AttachmentItem(file_token=token, name=name, size=size)
 

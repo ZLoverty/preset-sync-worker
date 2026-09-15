@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from material_worker.logging_setup import log
+from preset_sync_worker.logging_setup import log
 
 import time
 
-from material_worker.adapters.bitable import BitableClient
-from material_worker.services.submission_service import SubmissionService
+from preset_sync_worker.adapters.bitable import BitableClient
+from preset_sync_worker.services.submission_service import SubmissionService
 
 
-class MaterialWorker:
+class PresetSyncWorker:
     """轮询 daemon:找 已请求=true 的行,逐条交给 SubmissionService。"""
 
     def __init__(

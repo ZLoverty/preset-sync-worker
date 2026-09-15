@@ -11,12 +11,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from material_worker.adapters.lark_drive import (
+from preset_sync_worker.adapters.lark_drive import (
     DriveClient,
     DriveUpload,
     plan_names,
 )
-from material_worker.exceptions import DriveError, PermanentError, RetryableError
+from preset_sync_worker.exceptions import DriveError, PermanentError, RetryableError
 
 ROOT = "root-token"
 

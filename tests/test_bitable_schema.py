@@ -12,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from material_worker import fields
-from material_worker.adapters.bitable import (
+from preset_sync_worker import fields
+from preset_sync_worker.adapters.bitable import (
     AUTO_CREATE_FIELDS,
     _VALIDATE_ONLY_FIELDS,
     BitableClient,
@@ -27,8 +27,8 @@ from material_worker.adapters.bitable import (
     FIELD_TYPE_SINGLE_SELECT,
     FIELD_TYPE_TEXT,
 )
-from material_worker.domain.status import SubmissionStatus
-from material_worker.exceptions import PermanentError
+from preset_sync_worker.domain.status import SubmissionStatus
+from preset_sync_worker.exceptions import PermanentError
 
 
 class FakeFieldListResponse:

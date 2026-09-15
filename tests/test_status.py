@@ -1,6 +1,6 @@
 import pytest
 
-from material_worker.domain.status import (
+from preset_sync_worker.domain.status import (
     InvalidTransitionError,
     SubmissionStatus,
 )

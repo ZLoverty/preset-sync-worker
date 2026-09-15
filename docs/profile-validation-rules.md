@@ -289,7 +289,7 @@ filament_id  =  "J" + PI code
 
 前缀**已定 = `J`**(决策 16,2026-09-12)。选它的理由见下方"为什么是 `J`":首字符不是 `P`(绕开那条 AMS 分支),与 BBL 全库零交集,且短。
 
-不再维护 `PMxx` 表 —— PI code 本来就是基础数据的**必填字段**([profile.py:93](preset-sync-worker/src/material_worker/domain/profile.py#L93) `ProfileField("pi_code", ..., True, False)`),而且**它就是 preset-db 的顶层目录名**,天然是**产品级**的(`${PRESET_DIR}/${pi_code}/${brand}/${model}/${slicer}/...`)。因此同一产品的所有机型产物**自动共享同一个 id**,不需要任何映射。
+不再维护 `PMxx` 表 —— PI code 本来就是基础数据的**必填字段**([profile.py:93](preset-sync-worker/src/preset_sync_worker/domain/profile.py#L93) `ProfileField("pi_code", ..., True, False)`),而且**它就是 preset-db 的顶层目录名**,天然是**产品级**的(`${PRESET_DIR}/${pi_code}/${brand}/${model}/${slicer}/...`)。因此同一产品的所有机型产物**自动共享同一个 id**,不需要任何映射。
 
 **为什么这个形状是对的**(逐条对应实测):
 

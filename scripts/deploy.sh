@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Install/update Material Profile Worker as a system-level systemd service.
+# Install/update preset-sync-worker as a system-level systemd service.
 # Run from the repository on Ubuntu: sudo bash scripts/deploy.sh
 
 SERVICE_NAME="preset-sync-worker"
@@ -61,6 +61,8 @@ done
 
 python3 -m venv "${INSTALL_DIR}/.venv"
 "${INSTALL_DIR}/.venv/bin/python" -m pip install --upgrade pip
+# Remove the previous distribution/console-script names during in-place upgrades.
+"${INSTALL_DIR}/.venv/bin/python" -m pip uninstall --yes material-profile-worker >/dev/null 2>&1 || true
 "${INSTALL_DIR}/.venv/bin/python" -m pip install "${INSTALL_DIR}"
 
 chown -R root:root "${INSTALL_DIR}"
@@ -81,7 +83,7 @@ Group=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${INSTALL_DIR}/.venv/bin/material-worker
+ExecStart=${INSTALL_DIR}/.venv/bin/${SERVICE_NAME}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=30s

@@ -1,4 +1,4 @@
-# Material Profile Worker — Phase 2:缺陷与需求记录
+# preset-sync-worker — Phase 2:缺陷与需求记录
 
 > 阶段 1([agent-instruction.md](agent-instruction.md) 的 P0–P7)已实现并验收通过。
 > 本文件记录阶段 2 的缺陷与需求,供后续实现。条目编号:`V2-P<n>`,代码注释/测试引用同一编号。
@@ -34,9 +34,9 @@
 
 | 位置 | 内容 |
 |---|---|
-| [domain/status.py](../src/material_worker/domain/status.py) | `TERMINAL_STATES` 把 `审核中` 归为已收尾;`RETRYABLE_FOR_SAME_SUBMISSION` 不含 REVIEWING |
-| [domain/submission.py](../src/material_worker/domain/submission.py) | `resolve_submission_id`:终态 → 直接生成新 ID |
-| [services/submission_service.py](../src/material_worker/services/submission_service.py) | `process_record` 按快照状态调用上述解析 |
+| [domain/status.py](../src/preset_sync_worker/domain/status.py) | `TERMINAL_STATES` 把 `审核中` 归为已收尾;`RETRYABLE_FOR_SAME_SUBMISSION` 不含 REVIEWING |
+| [domain/submission.py](../src/preset_sync_worker/domain/submission.py) | `resolve_submission_id`:终态 → 直接生成新 ID |
+| [services/submission_service.py](../src/preset_sync_worker/services/submission_service.py) | `process_record` 按快照状态调用上述解析 |
 | [README.md](../README.md) | 「重复点击语义」段落:审核中/已通过/已拒绝 = 新一轮提交 |
 | [test_service.py](../tests/test_service.py) | `test_terminal_state_click_opens_new_submission` **固化了当前行为**,语义变更时须连带改写 |
 
@@ -66,7 +66,7 @@
 
 ### 现状与问题
 
-- 建表指南([README](../README.md))与 [fields.py](../src/material_worker/fields.py) 注释都要求「状态」为人工创建的单选列,但 `ensure_schema`([bitable.py](../src/material_worker/adapters/bitable.py) 第 269 行起)**只校验列存在性,不校验列类型**;
+- 建表指南([README](../README.md))与 [fields.py](../src/preset_sync_worker/fields.py) 注释都要求「状态」为人工创建的单选列,但 `ensure_schema`([bitable.py](../src/preset_sync_worker/adapters/bitable.py) 第 269 行起)**只校验列存在性,不校验列类型**;
 - 「状态」被误建为文本/多选列时,worker 照常启动、写入照常成功,但取值不构成选项,下拉筛选、按选项语义的自动化都会不可靠——错误在运行时才暴露。
 
 ### 期望行为
@@ -143,7 +143,7 @@ Gitea 侧 PR 被关闭(未合并)时,worker 审查同步把行置为 `已拒绝`
    GitHub:timeline 事件。API 形态按提供方实测确认(参考阶段 1 处理 Gitea
    `commit.id` 差异的前例);
 2. **落点**:新增文本列「关闭理由」——与既有文本列一致,由 worker 启动自动创建
-   ([fields.py](../src/material_worker/fields.py) + `ensure_schema` 同步)。
+   ([fields.py](../src/preset_sync_worker/fields.py) + `ensure_schema` 同步)。
    关闭但无文字说明 → 留空还是兜底文案(如「PR 已关闭,未说明原因」),待定;
 3. **边界**:merged 的 PR 不算「被关闭」→ 置 `已通过`,不查理由;
    只有 closed-unmerged 才反写理由;
@@ -209,7 +209,7 @@ Gitea 侧 PR 被关闭(未合并)时,worker 审查同步把行置为 `已拒绝`
 
 ### 与现有实现的差距(实施参考)
 
-- 阶段 1 `MaterialProfile` 仅 3+1 字段——[domain/profile.py](../src/material_worker/domain/profile.py) 需扩展为全量 schema,键集合对齐 Polymaker-Preset 键注册表的 material 层;
+- 阶段 1 `MaterialProfile` 仅 3+1 字段——[domain/profile.py](../src/preset_sync_worker/domain/profile.py) 需扩展为全量 schema,键集合对齐 Polymaker-Preset 键注册表的 material 层;
 - 表格新增约 17 个文本/数字列 + 照片列(与既有文本/数字列自动补齐机制一致);
 - 全量列 = V2-P2「JSON 附件上传 → 反写」的反写目标(附件 JSON 一次带全量参数,而非 3 列);
 - 落盘文件的文件夹组织(用户 2026-09-07 所述):按 `material name / printer brand / printer model / slicer / profile`(即原 Polymaker preset 的文件组织形式)。

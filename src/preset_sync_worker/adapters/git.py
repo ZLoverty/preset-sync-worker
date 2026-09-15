@@ -10,12 +10,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from material_worker.domain.profile import (
+from preset_sync_worker.domain.profile import (
     MaterialProfile,
     describe_changes,
     parse_profile_json,
 )
-from material_worker.exceptions import (
+from preset_sync_worker.exceptions import (
     GitRepositoryError,
     PermanentError,
     RetryableError,
@@ -567,12 +567,12 @@ class GitRepository:
         改了什么 —— 审查者据此就能判断这次调整合不合理,不必自己点开
         diff 逐键比对;字段标签用表格列名、数值带单位,不出现内部键名。
 
-        过程记录只列**文件名**,附件本体不进仓库:审查者要看的正是
-        「这次调参的依据」,放在 diff 旁边才对照得起来。文件名下面是
-        `process_records_folder_url`(原件在云文档里的位置)—— 这里只
-        当成一个不透明的链接字符串,**本模块不认识飞书**,也不拼 URL。
+        过程记录附件本体不进仓库。只要本轮有附件且提供了
+        `process_records_folder_url`,正文就添加单行「过程记录: <链接>」；
+        文件名清单不放在正文里。这里把链接当成不透明字符串，**本模块
+        不认识飞书**，也不拼 URL。未提供链接时不生成过程记录行。
 
-        只写正文 —— commit message 是纯文本、不渲染,不适合摆记录清单;
+        只写正文 —— commit message 是纯文本、不渲染,不适合摆过程记录链接;
         而每轮一行一个 PR,同一 branch 上累积的多轮也各由那一轮的正文承载。
         """
         lines = [f"{profile.identity} · {profile.slicer}", ""]

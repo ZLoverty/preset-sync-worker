@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from material_worker.domain.profile import MaterialProfile
-from material_worker.domain.status import SubmissionStatus
+from preset_sync_worker.domain.profile import MaterialProfile
+from preset_sync_worker.domain.status import SubmissionStatus
 
 
 @dataclass

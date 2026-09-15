@@ -5,8 +5,8 @@ import pytest
 
 from helpers import make_profile, row_fields
 
-from material_worker import fields
-from material_worker.domain.profile import (
+from preset_sync_worker import fields
+from preset_sync_worker.domain.profile import (
     FIELD_SCHEMA,
     REQUIRED_FIELDS,
     MaterialProfile,

@@ -1,4 +1,4 @@
-# Material Profile Worker — Phase 3:需求细化
+# preset-sync-worker — Phase 3:需求细化
 
 ## 原始需求(用户 2026-09-11)
 
@@ -34,7 +34,7 @@
 | 12 | 参考表 | worker **完全不读** PI Codes / Printers / Slicers / Methods 四张表 |
 | 13 | 附件导入 | 解析改为"只找关心的键,找不到跳过";支持 `.json` 与 Prusa `.ini`;反写后**不自动提交** |
 | 14 | 提交人/提交时间 | 按钮 Automation 写入这两列,worker 读出后写进 PR(V3-P7) |
-| 15 | 过程记录 | 附件**不进 Git**:原件上传**飞书云文档**长期存档,文件名 + 一行文件夹链接写进 **PR 正文**(不进 commit message);**提交成功后清空该列**(已确认:每条改动与记录一一对应)。**§ V3-P10 细化,取代 V3-P8 的第 1、4 条** |
+| 15 | 过程记录 | 附件**不进 Git**:原件上传**飞书云文档**长期存档,PR 正文仅放一行 `过程记录: <文件夹链接>`(不列文件名、不进 commit message);**提交成功后清空该列**。未配置云文档目录时不存档,正文不显示过程记录行。**§ V3-P10 细化,取代 V3-P8 的第 1、4 条** |
 | 16 | 压力提前 | `BBL` 机型**忽略且不报错**(V2 的"填了即报错"作废);非 BBL 输出 `pressure_advance` + `enable_pressure_advance: 1` |
 | 17 | 重复身份 | 检测到同身份的另一行 → 该行永久失败,不提交 PR(V3-P9) |
 
@@ -54,7 +54,7 @@ Pages(构建产物,不进 repo)
 
 ### 现状
 
-`ensure_schema`([adapters/bitable.py](../src/material_worker/adapters/bitable.py))按 V2 时代的列名工作:会自动创建 `品名`/`品牌`/`机型`/`切片器`/`材料ID`/`切片器版本`/`提交 ID`/`重试次数` 等列 —— 这些列在新表里**已不存在或已改名**,继续运行会把它们重新建出来,污染表格。
+`ensure_schema`([adapters/bitable.py](../src/preset_sync_worker/adapters/bitable.py))按 V2 时代的列名工作:会自动创建 `品名`/`品牌`/`机型`/`切片器`/`材料ID`/`切片器版本`/`提交 ID`/`重试次数` 等列 —— 这些列在新表里**已不存在或已改名**,继续运行会把它们重新建出来,污染表格。
 
 ### 新表实况(2026-09-11 读取,27 列)
 
@@ -75,7 +75,7 @@ Pages(构建产物,不进 repo)
 | `回抽距离` | 数字 | `filament_retraction_length`(可选) |
 | `压力提前` | 数字 | `pressure_advance`(可选,BBL 忽略) |
 | `调参方法版本` | 单选(v1 / v1_t1) | `pm_method_version`(必填) |
-| `过程记录` | 附件 | 仅取文件名进 PR 正文(V3-P8) |
+| `过程记录` | 附件 | 上传归档并在 PR 正文提供文件夹链接(V3-P10) |
 | `提交审核` | 按钮(3001) | 触发入口(人工/Automation) |
 | `已请求` | 复选框 | 触发信号(worker 清除) |
 | `状态` | 单选(7 个) | 状态机 |
@@ -368,15 +368,12 @@ V3-P8 的语义是「附件不下载,只把**文件名**写进 PR 正文,PR 建�
 
 ### 期望行为
 
-1. 提交时把 `过程记录` 的附件**上传到飞书云文档**长期存档,PR 正文在文件名清单下面多**一行文件夹链接**:
+1. 提交时把 `过程记录` 的附件**上传到飞书云文档**长期存档,PR 正文只增加**一行文件夹链接**,不列附件文件名:
 
    ```
-   过程记录:
-   - 2026-09-10_温度塔.jpg
-   - 2026-09-10_流量校准.jpg
-   文件夹: https://jfpolymers.feishu.cn/drive/folder/boxcnXXXX
+   过程记录: https://jfpolymers.feishu.cn/drive/folder/boxcnXXXX
    ```
-   文件名清单保留为清单,**不加重逐文件链接**(一行文件夹链接足够,正文不喧宾夺主);
+
 2. **目录结构 —— 一个文件夹 = 一次提交**:
 
    ```
@@ -390,7 +387,7 @@ V3-P8 的语义是「附件不下载,只把**文件名**写进 PR 正文,PR 建�
 3. **失败 = 报错、不建 PR(fail-closed)**:上传失败则本轮**不建 PR**、`过程记录` 列**不清空**、行保持「处理中 + 已请求」下轮重试。**证据优先于 PR** —— PR 一旦建出来,正文里那个文件夹链接就必须是真的;
 4. **单文件 > 20MB 报错、不建 PR**,提示压缩后重传(不做分片上传 —— `upload_all` 的接口硬限制);
 5. 适配器**只做三件事**:列目录、建目录、上传。**不删除、不移动、不改权限**(`drive:drive` 足够做删除,是**不写**,不是做不到 —— 目标目录是只增不删的证据仓库);
-6. 未配置 `FEISHU_DRIVE_FOLDER_TOKEN` 时降级为 V3-P8 行为(只列文件名、不传、不留存),但**清列照常**。
+6. 未配置 `FEISHU_DRIVE_FOLDER_TOKEN` 时不上传、不留存,PR 正文不生成过程记录行,但**清列照常**。
 
 ### 验收标准
 
@@ -433,15 +430,15 @@ V3-P8 的语义是「附件不下载,只把**文件名**写进 PR 正文,PR 建�
 
 | 文件 | 改动 |
 |---|---|
-| [fields.py](../src/material_worker/fields.py) | 列名重写(删 8 列、加 热床温度/玻璃化温度/提交人/提交时间/过程记录) |
-| [domain/profile.py](../src/material_worker/domain/profile.py) | `FIELD_SCHEMA` 重写、必填位重排(含 `继承预设`)、派生身份与路径、`to_dict` 重写、附件解析改宽容 |
+| [fields.py](../src/preset_sync_worker/fields.py) | 列名重写(删 8 列、加 热床温度/玻璃化温度/提交人/提交时间/过程记录) |
+| [domain/profile.py](../src/preset_sync_worker/domain/profile.py) | `FIELD_SCHEMA` 重写、必填位重排(含 `继承预设`)、派生身份与路径、`to_dict` 重写、附件解析改宽容 |
 | domain/slicer_import.py(新) | Prusa `.ini` **导入映射表**(仅反写方向,V3-P6) |
-| [adapters/bitable.py](../src/material_worker/adapters/bitable.py) | `ensure_schema` 改为"部分自动创建 + 部分只校验";人员/日期列读取 |
-| [adapters/git.py](../src/material_worker/adapters/git.py) | branch 由身份派生;按 `PR URL` 查 PR;PR 正文讲 diff + 过程记录;commit message 只带提交人/时间 |
-| [services/submission_service.py](../src/material_worker/services/submission_service.py) | 附件反写去掉自动提交、重复身份检测、提交人/时间读取、过程记录清空;V3-P10 加 `round_folder_path` 与上传接线(fail-closed) |
+| [adapters/bitable.py](../src/preset_sync_worker/adapters/bitable.py) | `ensure_schema` 改为"部分自动创建 + 部分只校验";人员/日期列读取 |
+| [adapters/git.py](../src/preset_sync_worker/adapters/git.py) | branch 由身份派生;按 `PR URL` 查 PR;PR 正文讲 diff + 过程记录;commit message 只带提交人/时间 |
+| [services/submission_service.py](../src/preset_sync_worker/services/submission_service.py) | 附件反写去掉自动提交、重复身份检测、提交人/时间读取、过程记录清空;V3-P10 加 `round_folder_path` 与上传接线(fail-closed) |
 | adapters/lark_drive.py(新) | 云文档唯一交互入口:列目录 / 建目录 / 上传三件事,不含删除与权限(V3-P10) |
 | adapters/lark_transport.py(新) | `call_lark` 错误映射(限流码 → 可重试),Bitable 与 Drive 共用(V3-P10) |
-| [config.py](../src/material_worker/config.py) / [main.py](../src/material_worker/main.py) | V3-P10 三个云文档变量 + 启动自检 `check_access()` |
-| [domain/status.py](../src/material_worker/domain/status.py) / submission.py | 去掉 `submission_id` 解析与生成逻辑,改为身份派生 |
+| [config.py](../src/preset_sync_worker/config.py) / [main.py](../src/preset_sync_worker/main.py) | V3-P10 三个云文档变量 + 启动自检 `check_access()` |
+| [domain/status.py](../src/preset_sync_worker/domain/status.py) / submission.py | 去掉 `submission_id` 解析与生成逻辑,改为身份派生 |
 | [README.md](../README.md) | 建表指南、路径布局、必填可选、附件规则、仓库分工(Pages)同步更新 |
 | tests/ | 回归 + 新增用例(schema/身份/附件宽容/`.ini` 导入/重复身份) |

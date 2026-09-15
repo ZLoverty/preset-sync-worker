@@ -17,14 +17,14 @@ from lark_oapi.api.bitable.v1 import (
 )
 from lark_oapi.api.drive.v1 import DownloadMediaRequest
 
-from material_worker import fields
-from material_worker.adapters.lark_transport import call_lark
-from material_worker.domain.status import SubmissionStatus
-from material_worker.exceptions import (
+from preset_sync_worker import fields
+from preset_sync_worker.adapters.lark_transport import call_lark
+from preset_sync_worker.domain.status import SubmissionStatus
+from preset_sync_worker.exceptions import (
     BitableError,
     PermanentError,
 )
-from material_worker.logging_setup import log
+from preset_sync_worker.logging_setup import log
 
 # Feishu Bitable 字段 type:1=文本 2=数字 3=单选 4=多选 5=日期 7=复选框
 # 11=人员 17=附件 3001=按钮

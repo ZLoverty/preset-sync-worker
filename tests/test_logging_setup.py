@@ -1,6 +1,6 @@
 import logging
 
-from material_worker.logging_setup import log
+from preset_sync_worker.logging_setup import log
 
 
 def test_retry_and_user_action_logs_have_distinct_levels(caplog):

@@ -1,8 +1,8 @@
-# Material Profile Worker — Agent Instruction
+# preset-sync-worker — Agent Instruction
 
 ## 0. 任务背景
 
-本项目是 Material Profile Worker，用于将飞书多维表格中的材料参数转换为 Git 仓库中的标准材料 Profile，并通过 PR 进入审核流程。
+本项目是 preset-sync-worker，用于将飞书多维表格中的材料参数转换为 Git 仓库中的标准材料 Profile，并通过 PR 进入审核流程。
 
 阶段 1 已完成并验收：
 
@@ -101,9 +101,9 @@
 重点检查：
 
 ```text
-src/material_worker/domain/status.py
-src/material_worker/domain/submission.py
-src/material_worker/services/submission_service.py
+src/preset_sync_worker/domain/status.py
+src/preset_sync_worker/domain/submission.py
+src/preset_sync_worker/services/submission_service.py
 README.md
 tests/test_service.py
 ```
@@ -344,8 +344,8 @@ ensure_schema()
 重点修改：
 
 ```text
-src/material_worker/fields.py
-src/material_worker/adapters/bitable.py
+src/preset_sync_worker/fields.py
+src/preset_sync_worker/adapters/bitable.py
 ```
 
 重点检查：
@@ -761,8 +761,8 @@ worker 启动时自动创建。
 涉及：
 
 ```text
-src/material_worker/fields.py
-src/material_worker/adapters/bitable.py
+src/preset_sync_worker/fields.py
+src/preset_sync_worker/adapters/bitable.py
 ```
 
 ---

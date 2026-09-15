@@ -9,9 +9,9 @@ import pytest
 
 from helpers import make_profile as make_valid_profile
 
-from material_worker.adapters.git import GitRepository
-from material_worker.domain.status import InvalidTransitionError, SubmissionStatus
-from material_worker.domain.submission import MaterialSubmission
+from preset_sync_worker.adapters.git import GitRepository
+from preset_sync_worker.domain.status import InvalidTransitionError, SubmissionStatus
+from preset_sync_worker.domain.submission import MaterialSubmission
 
 
 def make_submission():

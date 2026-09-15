@@ -1,22 +1,22 @@
-class MaterialWorkerError(Exception):
+class PresetSyncWorkerError(Exception):
     pass
 
 
-class BitableError(MaterialWorkerError):
+class BitableError(PresetSyncWorkerError):
     pass
 
 
-class GitRepositoryError(MaterialWorkerError):
+class GitRepositoryError(PresetSyncWorkerError):
     pass
 
 
-class DriveError(MaterialWorkerError):
+class DriveError(PresetSyncWorkerError):
     """飞书云文档接口错误码失败(与 BitableError 平级,各自独立)。"""
 
 
-class RetryableError(MaterialWorkerError):
+class RetryableError(PresetSyncWorkerError):
     """Temporary error that should normally be retried."""
 
 
-class PermanentError(MaterialWorkerError):
+class PermanentError(PresetSyncWorkerError):
     """Invalid input or other error that should not be automatically retried."""

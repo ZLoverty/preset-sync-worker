@@ -1,4 +1,4 @@
-# Material Profile Worker
+# preset-sync-worker
 
 Feishu Bitable 按钮 → Automation 写入 `提交人`/`提交时间` 并置 `已请求=true` → worker 轮询 → **基础数据 JSON** 写入 `preset-db` 并开 PR → 回写 `状态=审核中`。
 
@@ -159,7 +159,7 @@ Prusa 无对等键的(`temperature_vitrification`、写在 `start_filament_gcode
 | `FEISHU_APP_TOKEN` / `FEISHU_TABLE_ID` | ✅ | 目标多维表格 |
 | `GIT_REPOSITORY_URL` | ✅ | Git 仓库 **https** URL(SSH 形式不支持,HTTP API 模式需要 token)。host 为 github.com 走 GitHub API,其余按 Gitea `/api/v1` |
 | `GIT_ACCESS_TOKEN` | ✅ | GitHub / Gitea Personal Access Token。**除仓库读写外还需 issue 读取权限**:关闭理由取自 PR 评论(`GET /issues/{n}/comments`),Gitea token 缺 `read:issue` 时该端点一律 403 —— 这与仓库是否公开无关(匿名可读 ≠ 该 token 有权限),缺了它只会表现为「关闭理由写不回来」 |
-| `FEISHU_DRIVE_FOLDER_TOKEN` | 默认空 | `过程记录` 附件的云文档存档根目录(取文件夹链接末段)。**留空 = 关闭上传**:过程记录退回只在 PR 正文列文件名,原件不留存。**前提**:应用需有 `drive:drive` 权限,且该文件夹已**共享给应用**;两者缺一,worker 会在启动自检时直接失败(不会带到每一行去重试) |
+| `FEISHU_DRIVE_FOLDER_TOKEN` | 默认空 | `过程记录` 附件的云文档存档根目录(取文件夹链接末段)。**留空 = 关闭上传**:附件不存档,PR 正文不生成过程记录行。**前提**:应用需有 `drive:drive` 权限,且该文件夹已**共享给应用**;两者缺一,worker 会在启动自检时直接失败(不会带到每一行去重试) |
 | `FEISHU_DRIVE_MAX_FILE_BYTES` | 默认 20971520 | 单文件上传上限(字节)。飞书 `upload_all` 接口硬限制 20MB,调大无用 —— 更大的文件需分片上传(未实现),超限**报错且不建 PR** |
 | `FEISHU_HOST` | 默认 jfpolymers.feishu.cn | 拼云文档链接用的租户域名 |
 | `POLL_INTERVAL` | 默认 5 | 轮询间隔(秒) |
@@ -231,10 +231,7 @@ L1002@BBL P2S · BambuStudio
 流量比例: 0.95 → 0.92
 回抽距离: (未设置) → 0.4 mm
 
-过程记录:
-- 2026-09-10_温度塔.jpg
-- 2026-09-10_流量校准.jpg
-文件夹: https://jfpolymers.feishu.cn/drive/folder/boxcnXXXX
+过程记录: https://jfpolymers.feishu.cn/drive/folder/boxcnXXXX
 
 提交人: 张三 · 提交时间: 2026-09-11 10:23
 ```
@@ -243,7 +240,7 @@ L1002@BBL P2S · BambuStudio
 - **身份四要素不重复列出**(每个文件路径下恒定,首行已交代),派生键 `enable_pressure_advance` 也不列(`压力提前` 讲一遍就够);
 - 没动的字段不出现 —— 审查者一眼看到这次改了什么,不必自己点开 diff 逐键比对;全文件一致时根本不会建 PR(空变更保护);
 - `提交人`/`提交时间` 由 worker 在 claim 时读出(人员列取姓名,日期列按本地时间格式化),**不修改这两列**;为空写 `(未记录)`,不影响提交。Git 的 author 字段不做改动;
-- `过程记录` 列的附件**不进 Git 仓库**(体积量级是百 GB 级,进仓库历史/GitHub Releases 都是死路),而是**上传到飞书云文档**长期存档:PR 正文里列文件名,并附一行指向本轮文件夹的链接(放在 diff 下面 —— 调参依据就在改动旁边),**不进 commit message**(纯文本不渲染,不适合展示记录清单);PR 创建成功后**清空该列**(原件已在云文档里,这一格要腾给下一轮)。每轮一行一个 PR,记录跟着那一轮的正文走 —— 逐轮对应由 PR 本身承载(同一 branch 上的历史 PR 不会消失)。**未配置 `FEISHU_DRIVE_FOLDER_TOKEN` 时降级**:只列文件名、不传、不留存。
+- `过程记录` 列的附件**不进 Git 仓库**(体积量级是百 GB 级,进仓库历史/GitHub Releases 都是死路),而是**上传到飞书云文档**长期存档:有附件且上传成功时,PR 正文放一行 `过程记录: <本轮文件夹链接>`;**不在正文列文件名**,也不进 commit message。PR 创建成功后**清空该列**(原件已在云文档里,这一格要腾给下一轮)。每轮一行一个 PR,记录跟着那一轮的正文走 —— 逐轮对应由 PR 本身承载(同一 branch 上的历史 PR 不会消失)。**未配置 `FEISHU_DRIVE_FOLDER_TOKEN` 时**:附件不上传,PR 正文不生成过程记录行,表格里的附件在提交成功后仍按既定规则清空。
 
 ### 过程记录存档布局(V3-P10)
 
@@ -270,7 +267,7 @@ L1002@BBL P2S · BambuStudio
 
 ```bash
 pip install -e ".[dev]"
-material-worker            # 或 python -m material_worker.main
+preset-sync-worker
 python -m pytest tests/ -v
 ```
 

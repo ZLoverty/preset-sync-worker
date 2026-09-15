@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from material_worker.exceptions import MaterialWorkerError, RetryableError
+from preset_sync_worker.exceptions import PresetSyncWorkerError, RetryableError
 
 #: 飞书全局限流/系统繁忙码
 RATE_LIMIT_CODE = 99991400
@@ -26,7 +26,7 @@ def call_lark(
     action: str,
     *,
     surface: str,
-    error_cls: type[MaterialWorkerError],
+    error_cls: type[PresetSyncWorkerError],
 ) -> Any:
     """执行一次 lark SDK 调用并归一化失败。
 

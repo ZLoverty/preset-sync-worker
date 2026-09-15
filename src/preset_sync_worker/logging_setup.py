@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import logging
 import sys
 
@@ -18,13 +17,6 @@ def configure_logging() -> None:
 
 def log(message: str) -> None:
     """Compatibility shim for existing human-readable events, with severity."""
-    frame = inspect.currentframe()
-    caller = frame.f_back if frame else None
-    name = (
-        caller.f_globals.get("__name__", "material_worker")
-        if caller
-        else "material_worker"
-    )
     text = str(message)
     if text.startswith(("[严重错误]", "[Worker Error]")):
         level = logging.ERROR
@@ -47,6 +39,6 @@ def log(message: str) -> None:
     include_traceback = text.startswith(
         ("[严重错误]", "[Worker Error]", "[记录异常", "[审查同步失败]")
     ) and sys.exc_info()[0] is not None
-    logging.getLogger(name).log(
+    logging.getLogger("preset-sync-worker").log(
         level, text, exc_info=include_traceback or None
     )

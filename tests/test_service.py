@@ -20,15 +20,15 @@ from helpers import (
     row_fields,
 )
 
-from material_worker import fields
-from material_worker.adapters.bitable import (
+from preset_sync_worker import fields
+from preset_sync_worker.adapters.bitable import (
     AttachmentItem,
     BitableClient,
 )
-from material_worker.adapters.git import GitRepository, PullRequestResult
-from material_worker.domain.status import SubmissionStatus
-from material_worker.exceptions import BitableError, PermanentError, RetryableError
-from material_worker.services.submission_service import (
+from preset_sync_worker.adapters.git import GitRepository, PullRequestResult
+from preset_sync_worker.domain.status import SubmissionStatus
+from preset_sync_worker.exceptions import BitableError, PermanentError, RetryableError
+from preset_sync_worker.services.submission_service import (
     CLOSE_REASON_ERROR_DETAIL_MAX,
     CLOSE_REASON_FALLBACK,
     CLOSE_REASON_READ_ERROR,
@@ -1568,7 +1568,7 @@ class FakeDrive:
             folder[item.name] = item.content
             uploaded += 1
 
-        from material_worker.adapters.lark_drive import DrivePublishResult
+        from preset_sync_worker.adapters.lark_drive import DrivePublishResult
 
         return DrivePublishResult(
             folder_token=f"fld-{leaf}",

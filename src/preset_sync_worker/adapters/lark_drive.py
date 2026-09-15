@@ -31,8 +31,8 @@ from lark_oapi.api.drive.v1 import (
     UploadAllFileRequestBody,
 )
 
-from material_worker.adapters.lark_transport import call_lark
-from material_worker.exceptions import DriveError, PermanentError
+from preset_sync_worker.adapters.lark_transport import call_lark
+from preset_sync_worker.exceptions import DriveError, PermanentError
 
 #: 云空间节点类型(ListFile 返回的 type 字段)
 FOLDER_TYPE = "folder"

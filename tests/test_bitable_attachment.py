@@ -15,14 +15,14 @@ import pytest
 
 from helpers import attachment_cell
 
-from material_worker import fields
-from material_worker.adapters.bitable import (
+from preset_sync_worker import fields
+from preset_sync_worker.adapters.bitable import (
     AttachmentItem,
     BitableClient,
     date_text,
     person_names,
 )
-from material_worker.exceptions import BitableError, RetryableError
+from preset_sync_worker.exceptions import BitableError, RetryableError
 
 
 class FakeDownloadResponse:

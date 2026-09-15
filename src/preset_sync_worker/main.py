@@ -4,13 +4,13 @@ import logging
 
 import lark_oapi as lark
 
-from material_worker.adapters.bitable import BitableClient
-from material_worker.adapters.git import GitRepository
-from material_worker.adapters.lark_drive import DriveClient
-from material_worker.config import Settings
-from material_worker.logging_setup import configure_logging, log
-from material_worker.services.submission_service import SubmissionService
-from material_worker.worker import MaterialWorker
+from preset_sync_worker.adapters.bitable import BitableClient
+from preset_sync_worker.adapters.git import GitRepository
+from preset_sync_worker.adapters.lark_drive import DriveClient
+from preset_sync_worker.config import Settings
+from preset_sync_worker.logging_setup import configure_logging, log
+from preset_sync_worker.services.submission_service import SubmissionService
+from preset_sync_worker.worker import PresetSyncWorker
 
 
 def create_drive(settings: Settings, lark_client: lark.Client) -> DriveClient | None:
@@ -37,7 +37,7 @@ def create_drive(settings: Settings, lark_client: lark.Client) -> DriveClient | 
     )
 
 
-def create_worker(settings: Settings) -> MaterialWorker:
+def create_worker(settings: Settings) -> PresetSyncWorker:
     lark_client = (
         lark.Client.builder()
         .app_id(settings.feishu_app_id)
@@ -70,7 +70,7 @@ def create_worker(settings: Settings) -> MaterialWorker:
         max_retries=settings.max_retries,
     )
 
-    return MaterialWorker(
+    return PresetSyncWorker(
         bitable=bitable,
         submission_service=service,
     )

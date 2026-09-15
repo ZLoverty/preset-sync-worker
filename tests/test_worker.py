@@ -1,10 +1,10 @@
-"""MaterialWorker:全表快照只拉一次,三个阶段共用;daemon 级异常不终止(P6 #30)。
+"""PresetSyncWorker:全表快照只拉一次,三个阶段共用;daemon 级异常不终止(P6 #30)。
 
 V3:worker 每轮 `list_records()` 拉一次全表,同一份快照依次交给
 process_pending_rows / backfill_pending_json_rows / sync_reviewing_rows ——
 重复身份检测需要全表视角,顺带省掉三次全表拉取。
 """
-from material_worker.worker import MaterialWorker
+from preset_sync_worker.worker import PresetSyncWorker
 
 
 class StubBitable:
@@ -55,7 +55,7 @@ class CountingService:
 
 def test_boot_runs_ensure_schema():
     bitable = StubBitable([])
-    worker = MaterialWorker(bitable=bitable, submission_service=CountingService())
+    worker = PresetSyncWorker(bitable=bitable, submission_service=CountingService())
 
     worker.boot()
 
@@ -66,7 +66,7 @@ def test_poll_once_hands_the_same_snapshot_to_all_three_phases():
     """V3:全表只拉一次,三个阶段共用同一份快照。"""
     bitable = StubBitable([("rec-1", {"已请求": True})])
     service = CountingService()
-    worker = MaterialWorker(bitable=bitable, submission_service=service)
+    worker = PresetSyncWorker(bitable=bitable, submission_service=service)
 
     worker.poll_once()
 
@@ -79,7 +79,7 @@ def test_poll_once_hands_the_same_snapshot_to_all_three_phases():
 def test_poll_once_only_hands_out_pending_records():
     bitable = StubBitable([("rec-1", {"已请求": True}), ("rec-2", {"已请求": False})])
     service = CountingService()
-    worker = MaterialWorker(bitable=bitable, submission_service=service)
+    worker = PresetSyncWorker(bitable=bitable, submission_service=service)
 
     worker.poll_once()
 
@@ -92,7 +92,7 @@ def test_poll_once_isolates_record_errors():
     """单条记录异常不中断本轮其余记录 —— 由 service 内部隔离。"""
     bitable = StubBitable([("rec-1", {"已请求": True}), ("rec-2", {"已请求": True})])
     service = CountingService(boom_on="rec-1")
-    worker = MaterialWorker(bitable=bitable, submission_service=service)
+    worker = PresetSyncWorker(bitable=bitable, submission_service=service)
 
     try:
         worker.poll_once()
@@ -105,7 +105,7 @@ def test_poll_once_isolates_record_errors():
 def test_poll_once_runs_review_sync():
     bitable = StubBitable([])
     service = CountingService()
-    worker = MaterialWorker(bitable=bitable, submission_service=service)
+    worker = PresetSyncWorker(bitable=bitable, submission_service=service)
 
     worker.poll_once()
     worker.poll_once()
@@ -116,7 +116,7 @@ def test_poll_once_runs_review_sync():
 def test_poll_once_runs_attachment_backfill():
     bitable = StubBitable([])
     service = CountingService()
-    worker = MaterialWorker(bitable=bitable, submission_service=service)
+    worker = PresetSyncWorker(bitable=bitable, submission_service=service)
 
     worker.poll_once()
     worker.poll_once()
