@@ -24,6 +24,7 @@ from material_worker.exceptions import (
     PermanentError,
     RetryableError,
 )
+from material_worker.logging_setup import log
 
 # V2-P3:PR 被关闭(未合并)但 Git 侧无任何评论可作关闭理由时的兜底文案。
 CLOSE_REASON_FALLBACK = "PR 已关闭,未说明原因"
@@ -165,10 +166,15 @@ class SubmissionService:
         for record_id, row_fields in records:
             if row_fields.get(fields.REQUESTED) is not True:
                 continue
+            identity = self.identity_key(row_fields)
+            log(
+                f"[提交开始] record={record_id} identity={identity or '(身份字段不全)'} "
+                f"status={row_fields.get(fields.STATUS)!r}"
+            )
             try:
                 self.process_record(record_id, row_fields, index)
             except Exception as exc:
-                print(
+                log(
                     f"[记录异常] record={record_id} "
                     f"{type(exc).__name__}: {exc}"
                 )
@@ -212,7 +218,7 @@ class SubmissionService:
             try:
                 state = self.repository.pr_state(pr_url)
             except Exception as exc:
-                print(
+                log(
                     f"[审查同步失败] record={record_id} pr={pr_url}: "
                     f"{type(exc).__name__}: {exc}"
                 )
@@ -222,7 +228,7 @@ class SubmissionService:
             if state == "merged":
                 self._mark_reviewed(record_id, current, SubmissionStatus.APPROVED)
                 self._warned_no_pr.discard(warn_key)
-                print(
+                log(
                     f"[审查同步] record={record_id} {pr_url} -> 已通过 (PR 已合并)"
                 )
             elif state == "closed":
@@ -234,7 +240,7 @@ class SubmissionService:
                     close_reason,
                 )
                 self._warned_no_pr.discard(warn_key)
-                print(
+                log(
                     f"[审查同步] record={record_id} {pr_url} -> 已拒绝 "
                     f"(PR 关闭未合并,关闭理由: {close_reason or '(留空,待人工补充)'})"
                 )
@@ -256,7 +262,7 @@ class SubmissionService:
             else:
                 self.bitable.mark_rejected(record_id, close_reason)
         except Exception as exc:
-            print(
+            log(
                 f"[严重错误] 无法回写 {to.value} record={record_id}: {exc}"
             )
 
@@ -275,11 +281,11 @@ class SubmissionService:
             detail = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
             if len(detail) > CLOSE_REASON_ERROR_DETAIL_MAX:
                 detail = detail[:CLOSE_REASON_ERROR_DETAIL_MAX] + "…"
-            print(
+            log(
                 f"[审查同步] record={record_id} pr={pr_url} "
                 f"关闭理由读取失败,格子写占位文案待人工补充: {detail}"
             )
-            print(
+            log(
                 "          若上面是 403 鉴权失败:该 Git Token 缺少 issue "
                 "读取权限(Gitea 需 read:issue,/issues/{n}/comments "
                 "无此 scope 一律 403)"
@@ -295,7 +301,7 @@ class SubmissionService:
         if warn_key in self._warned_no_pr:
             return
         self._warned_no_pr.add(warn_key)
-        print(
+        log(
             f"[审查同步] record={record_id} {marker} 在 Git 上找不到对应 PR,"
             f"保持 审核中(若 PR 被手动删除,请人工处理该行)"
         )
@@ -327,7 +333,7 @@ class SubmissionService:
             try:
                 self._backfill_one(record_id, row_fields)
             except Exception as exc:
-                print(
+                log(
                     f"[记录异常-附件解析] record={record_id} "
                     f"{type(exc).__name__}: {exc}"
                 )
@@ -437,7 +443,7 @@ class SubmissionService:
         if not values:
             # 一个关心的键都没认出来 -> 静默跳过(不写错误、不反写、
             # **不清附件格**:没提取到任何东西就删掉用户的文件太粗暴)
-            print(
+            log(
                 f"[附件导入] record={record_id} 附件 {item.name!r} "
                 f"未包含任何关心的键,跳过(附件保留)"
             )
@@ -449,11 +455,11 @@ class SubmissionService:
                 record_id, self._import_payload(values)
             )
         except Exception as exc:
-            print(f"[严重错误] 附件反写失败 record={record_id}: {exc}")
+            log(f"[严重错误] 附件反写失败 record={record_id}: {exc}")
             self._json_parse_attempted.discard(attempt_key)  # 下轮自愈重试
             return
         # V3-P3:不再置「已请求」—— 是否提交由用户点按钮决定
-        print(
+        log(
             f"[附件导入] record={record_id} 由附件 {item.name!r} 反写 "
             f"{len(values)} 个字段(只填空,不自动提交),"
             f"并清空「{fields.PROFILE_JSON}」列"
@@ -492,11 +498,11 @@ class SubmissionService:
         try:
             self.bitable.update_record(record_id, {fields.ERROR_MSG: full})
         except Exception as update_exc:
-            print(
+            log(
                 f"[严重错误] 无法回写附件解析错误 record={record_id}: "
                 f"{update_exc}"
             )
-        print(f"[附件解析失败] record={record_id}: {message}")
+        log(f"[附件解析失败] record={record_id}: {message}")
 
     # ------------------------------------------------------------------
     # 提交路径的附件兜底(V3-P3:best-effort,绝不阻塞提交)
@@ -525,7 +531,7 @@ class SubmissionService:
             item = self._single_attachment(items)
             parsed = self._extract_from_attachment(item)
         except Exception as exc:
-            print(
+            log(
                 f"[附件导入(提交路径)] record={record_id} 附件未能导入,"
                 f"按表格现有数据继续: {type(exc).__name__}: {exc}"
             )
@@ -538,12 +544,12 @@ class SubmissionService:
         try:
             self.bitable.update_record(record_id, payload)
         except Exception as exc:
-            print(
+            log(
                 f"[严重错误] 提交前附件反写失败 record={record_id},"
                 f"按表格现有数据继续: {exc}"
             )
             return {**row_fields, **values}
-        print(
+        log(
             f"[附件导入(提交路径)] record={record_id} 由附件 {item.name!r} "
             f"反写 {len(values)} 个字段,并清空「{fields.PROFILE_JSON}」列"
             f" -> 继续常规提交"
@@ -733,7 +739,7 @@ class SubmissionService:
                 clear_process_record=bool(record_items),
             )
             self._retry_counts.pop(record_id, None)
-            print(
+            log(
                 f"[完成] record={record_id} "
                 f"identity={profile.identity} ({profile.slicer}) "
                 f"PR={result.pull_request_url}"
@@ -770,7 +776,7 @@ class SubmissionService:
         try:
             state = self.repository.pr_state(pr_url)
         except Exception as exc:
-            print(
+            log(
                 f"[重复点击:无法确认 PR] record={record_id} pr={pr_url} "
                 f"{type(exc).__name__}: {exc} "
                 f"(已请求 保持 true,下轮自动重试)"
@@ -779,14 +785,14 @@ class SubmissionService:
 
         self.bitable.clear_request(record_id)
         if state == "open":
-            print(
+            log(
                 f"[重复点击] record={record_id} {pr_url} "
                 f"在途 PR 仍打开:保持 审核中,不创建新 PR"
             )
         elif state is None:
             self._warn_pr_missing(record_id, pr_url)
         else:  # merged / closed:审查同步同轮落终态(已通过/已拒绝)
-            print(
+            log(
                 f"[重复点击] record={record_id} {pr_url} "
                 f"PR 状态={state}:交回审查同步落终态,不创建新 PR"
             )
@@ -808,7 +814,7 @@ class SubmissionService:
         _, current = self.bitable.get_record(record_id)
         status = str(current.get(fields.STATUS) or "").strip()
         if status != SubmissionStatus.PROCESSING.value:
-            print(
+            log(
                 f"[跳过] record={record_id} claim 后状态为 {status!r},"
                 f"已被他人改动,本行让行"
             )
@@ -824,10 +830,10 @@ class SubmissionService:
         try:
             self.bitable.mark_failed(record_id, message)
         except Exception as update_exc:
-            print(
+            log(
                 f"[严重错误] 无法回写失败状态 record={record_id}: {update_exc}"
             )
-        print(f"[数据/永久失败] record={record_id}: {message}")
+        log(f"[数据/永久失败] record={record_id}: {message}")
 
     def _handle_transient_failure(self, record_id: str, message: str) -> None:
         """瞬时失败:已请求 置回 true 由下轮自动重试,超过上限才失败。
@@ -847,12 +853,12 @@ class SubmissionService:
         try:
             self.bitable.mark_retryable(record_id, message)
         except Exception as update_exc:
-            print(
+            log(
                 f"[严重错误] 无法标记重试 record={record_id}: {update_exc}"
             )
             raise
 
-        print(
+        log(
             f"[重试] record={record_id} "
             f"({retry_count}/{self.max_retries}): {message}"
         )

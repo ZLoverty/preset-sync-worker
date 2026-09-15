@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from material_worker.logging_setup import log
+
 import time
 
 from material_worker.adapters.bitable import BitableClient
@@ -20,7 +22,7 @@ class MaterialWorker:
     def boot(self) -> None:
         """启动前自检:补齐 Bitable 缺失列,配置错误在此快速失败。"""
         self.bitable.ensure_schema()
-        print("[Schema] Bitable 列检查完成")
+        log("[Schema] Bitable 列检查完成")
 
     def poll_once(self) -> None:
         """一轮轮询。单条记录出错不中断本轮其余记录(P6 #30)。
@@ -42,13 +44,26 @@ class MaterialWorker:
         self.submission_service.sync_reviewing_rows(records)
 
     def run_forever(self, poll_interval: int) -> None:
+        last_error: str | None = None
+        consecutive_errors = 0
         while True:
             try:
                 self.poll_once()
+                if last_error is not None:
+                    log(
+                        f"[恢复] Bitable 轮询恢复正常，连续失败 {consecutive_errors} 次"
+                    )
+                    last_error = None
+                    consecutive_errors = 0
             except Exception as exc:
                 # worker 级错误(如 Bitable 整体不可达)不终止 daemon
-                print(
-                    f"[Worker Error] {type(exc).__name__}: {exc}"
-                )
+                signature = f"{type(exc).__name__}: {exc}"
+                consecutive_errors += 1
+                if signature != last_error or consecutive_errors % 12 == 0:
+                    log(
+                        f"[Worker Error] Bitable 轮询失败 "
+                        f"(连续第 {consecutive_errors} 次): {signature}"
+                    )
+                last_error = signature
 
             time.sleep(poll_interval)

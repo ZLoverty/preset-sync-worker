@@ -67,6 +67,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
+Environment=PYTHONUNBUFFERED=1
 ExecStart=${INSTALL_DIR}/.venv/bin/material-worker
 Restart=on-failure
 RestartSec=10s

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 import lark_oapi as lark
 
 from material_worker.adapters.bitable import BitableClient
 from material_worker.adapters.git import GitRepository
 from material_worker.adapters.lark_drive import DriveClient
 from material_worker.config import Settings
+from material_worker.logging_setup import configure_logging, log
 from material_worker.services.submission_service import SubmissionService
 from material_worker.worker import MaterialWorker
 
@@ -20,7 +23,7 @@ def create_drive(settings: Settings, lark_client: lark.Client) -> DriveClient | 
     if not settings.feishu_drive_folder_token:
         # 「忘配」和「故意关」长得一样,所以必须大声 —— 否则过程记录会静默地
         # 退回「只留文件名、原件不留存」。
-        print(
+        log(
             "[配置] 未配置 FEISHU_DRIVE_FOLDER_TOKEN:"
             "过程记录只写文件名,不上传飞书云文档(原件不留存)"
         )
@@ -58,7 +61,7 @@ def create_worker(settings: Settings) -> MaterialWorker:
         # 启动自检:列一次根目录。应用缺 drive:drive 或文件夹没共享给应用
         # 都在这里立刻失败(与 boot() 里的 ensure_schema 同类检查)。
         drive.check_access()
-        print(f"[Drive] 过程记录将存档到云文档根目录 {settings.feishu_drive_folder_token}")
+        log(f"[Drive] 过程记录将存档到云文档根目录 {settings.feishu_drive_folder_token}")
 
     service = SubmissionService(
         bitable=bitable,
@@ -74,10 +77,12 @@ def create_worker(settings: Settings) -> MaterialWorker:
 
 
 def main() -> None:
+    configure_logging()
+    log("[启动] preset-sync-worker starting")
     settings = Settings.from_env()
     worker = create_worker(settings)
 
-    print(
+    log(
         f"开始监听：每 {settings.poll_interval}s 轮询 "
         f"(自动重试上限 {settings.max_retries} 次)"
     )
@@ -87,4 +92,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("[停止] 收到中断信号，worker 正常退出")
+    except Exception:
+        logging.getLogger(__name__).exception("[启动失败] worker 无法启动")
+        raise SystemExit(1)

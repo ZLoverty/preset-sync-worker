@@ -24,6 +24,7 @@ from material_worker.exceptions import (
     BitableError,
     PermanentError,
 )
+from material_worker.logging_setup import log
 
 # Feishu Bitable 字段 type:1=文本 2=数字 3=单选 4=多选 5=日期 7=复选框
 # 11=人员 17=附件 3001=按钮
@@ -580,4 +581,4 @@ class BitableClient:
             lambda: self.client.bitable.v1.app_table_field.create(request),
             f"create field {field_name}",
         )
-        print(f"[Schema] 已创建 Bitable 列: {field_name}")
+        log(f"[Schema] 已创建 Bitable 列: {field_name}")
